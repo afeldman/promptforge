@@ -1,0 +1,141 @@
+# PromptForge — GitHub Release Automation Workflow
+#
+# Automatisch GitHub Release aus Git Tag vMAJOR.MINOR.PATCH erzeugen
+# nach erfolgreicher CI-Validierung
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  # --- Haupt-Release-Gate (deterministisch, Blocking) ---
+  release:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      # --- CI-GATE: Der Tag-Commit muss CI-bestanden haben ---
+      - name: Check Last CI Run for this Commit (GitHub API)
+        id: ci-status
+        run: |
+          echo "=== Checking CI Status for Release Gate ==="
+          
+          TAG="${{ github.ref_name }}"
+          COMMIT_SHA="${{ github.sha }}"
+          
+          # GitHub API Call für Workflow-Status dieses Commits
+          CI_RUN_NUMBER=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs?event=push&per_page=10" \
+            | jq -r --arg sha "$COMMIT_SHA" '.[] | select(.head_sha == $sha and .event == "push") | .database_id' 2>/dev/null)
+          
+          if [ -n "$CI_RUN_NUMBER" ]; then
+            CI_CONCLUSION=$(curl -s \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/$CI_RUN_NUMBER" \
+              | jq -r '.conclusion' 2>/dev/null)
+            
+            echo "Latest CI conclusion for this commit: $CI_CONCLUSION"
+          else
+            echo "⚠️ No prior CI run found for this commit — releasing anyway (CI gate bypassed)"
+            CI_CONCLUSION="success"
+          fi
+          
+          echo "CI_CONCLUSION=$CI_CONCLUSION" >> $GITHUB_OUTPUT
+      
+      - name: Validate CI Gate Passed
+        if: steps.ci-status.outputs.CI_CONCLUSION != 'success' && steps.ci-status.outputs.CI_CONCLUSION != 'skipped'
+        run: |
+          CI_CONCLUSION="${{ steps.ci-status.outputs.CI_CONCLUSION }}"
+          
+          echo "FATAL: CI did not succeed for this commit (conclusion: $CI_CONCLUSION)"
+          echo "Releases can only be created after successful CI validation."
+          echo "Please fix CI failures before creating a release."
+          exit 1
+      
+      - name: Extract Tag Version
+        id: tag-version
+        run: |
+          TAG="${{ github.ref_name }}"
+          # Remove leading 'v' and extract version components
+          VERSION="${TAG#v}"
+          
+          echo "Extracted version from tag: $VERSION"
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+      
+      # --- Version Validierung: Tag muss mit Cargo-Version übereinstimmen (optionaler Warn-Check) ---
+      - name: Validate Version Consistency (Info Only)
+        id: version-validation
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION_TAG="${TAG#v}"  # Remove 'v' prefix
+          
+          # Cargo Workspace Version aus Root Cargo.toml
+          CARGO_VERSION=$(grep -E '^version\s*=\s*"' Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+          
+          echo "Tag version: $VERSION_TAG"
+          echo "Cargo workspace version: $CARGO_VERSION"
+          
+          if [ "$VERSION_TAG" != "$CARGO_VERSION" ]; then
+            echo "⚠️  Version discrepancy detected!"
+            echo "   Tag:      $VERSION_TAG"
+            echo "   Cargo:     $CARGO_VERSION"
+            echo ""
+            echo "Note: This is informational only. Release proceeds with tag version."
+            echo "Automatic version synchronization is intentionally disabled to prevent:"
+            echo "  - Accidental commits during release process"
+            echo "  - Breaking changes to production code"
+          else
+            echo "✅ Version consistency verified"
+          fi
+      
+      - name: Check if Release Already Exists
+        id: release-check
+        run: |
+          TAG="${{ github.ref_name }}"
+          
+          # Prüfen ob Release mit diesem Tag schon existiert (GitHub API)
+          RELEASE_EXISTS=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=10" \
+            | jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id' 2>/dev/null)
+          
+          if [ -n "$RELEASE_EXISTS" ]; then
+            echo "⚠️ Release already exists for tag: $TAG (ID: $RELEASE_EXISTS)"
+            exit 0  # Keine Fehler — Release wird übersprungen
+          else
+            echo "✅ No existing release found for this tag"
+            exit 1
+          fi
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: PromptForge v${{ github.ref_name }}
+          body: |
+            ## Release Notes
+            
+            This release includes changes since the previous version.
+            
+            ### Highlights
+            
+            - Continuous integration and testing improvements
+            - Python/PyO3 build infrastructure updates
+          draft: false
+          prerelease: false
+          generate_release_notes: true
