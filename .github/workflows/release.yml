@@ -1,7 +1,7 @@
-# PromptForge — GitHub Release Automation Workflow (Repaired CI Gate)
+# PromptForge — GitHub Release Automation Workflow
 #
 # Automatisch GitHub Release aus Git Tag vMAJOR.MINOR.PATCH erzeugen
-# nach erfolgreicher CI-Validierung
+# nach erfolgreicher CI-Validierung via ci.yml
 
 name: Release
 
@@ -49,17 +49,17 @@ jobs:
           ATTEMPT=1
           SLEEP_INTERVAL=20       # Sekunden zwischen Polling-Runden
           
-          # GitHub API Token von Umgebungsvariable oder Secrets
-          GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN:-}}"
+          # GitHub Token für API-Zugriffe (standardmäßig von github bereitgestellt)
+          GH_TOKEN="${{ github.token }}"
+          echo "Using GH_TOKEN from github.token"
           
           # Funktion: CI-Run für diesen Commit finden
           find_ci_run() {
             local response
             local run_id
             
-            response=$(curl -s \
+            response=$(GH_TOKEN="$GH_TOKEN" curl -s \
               -H "Accept: application/vnd.github.v3+json" \
-              -H "Authorization: token $GITHUB_TOKEN" \
               "https://api.github.com/repos/$REPO/actions/runs?event=push&per_page=100" 2>/dev/null) || return 1
             
             run_id=$(echo "$response" | jq -r --arg sha "$COMMIT_SHA" \
@@ -73,7 +73,7 @@ jobs:
             return 1
           }
           
-          # Funktion: CI-Run Details holen
+          # Funktion: CI-Run Conclusion holen
           get_run_conclusion() {
             local run_id="$1"
             
@@ -84,12 +84,11 @@ jobs:
             
             curl -s \
               -H "Accept: application/vnd.github.v3+json" \
-              -H "Authorization: token $GITHUB_TOKEN" \
               "https://api.github.com/repos/$REPO/actions/runs/$run_id" \
               | jq -r '.conclusion // empty' 2>/dev/null || echo ""
           }
           
-          # Funktion: CI-Run Status Details holen
+          # Funktion: CI-Run Status holen
           get_run_status() {
             local run_id="$1"
             
@@ -100,7 +99,6 @@ jobs:
             
             curl -s \
               -H "Accept: application/vnd.github.v3+json" \
-              -H "Authorization: token $GITHUB_TOKEN" \
               "https://api.github.com/repos/$REPO/actions/runs/$run_id" \
               | jq -r '.status // empty' 2>/dev/null || echo "unknown"
           }
@@ -113,7 +111,7 @@ jobs:
             CI_RUN=$(find_ci_run) || {
               if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
                 echo ""
-                echo "❌ CI GATE TIMEOUT: No successful ci.yml run found for commit $COMMIT_SHA within ${MAX_ATTEMPTS} attempts (${MAX_ATTEMPTS} * ${SLEEP_INTERVAL}s = ~${(( MAX_ATTEMPTS / 2 ))} minutes)"
+                echo "❌ CI GATE TIMEOUT: No successful ci.yml run found for commit $COMMIT_SHA within ${MAX_ATTEMPTS} attempts"
                 echo "CI runs may not have finished yet or CI workflow has issues."
                 exit 1
               else
@@ -176,8 +174,7 @@ jobs:
                 echo "   conclusion: $CI_CONCLUSION"
                 echo ""
                 
-                # Skipped ist ok für macOS-only Jobs, aber wir müssen sicherstellen, dass Linux CI success war
-                # Wir prüfen den Job-Status genauer
+                # Skipped ist ok für macOS-only Jobs, aber wir prüfen den Job-Status genauer
                 JOB_STATUS=$(echo "$response" | jq -r --arg run_id "$CI_RUN" \
                   '.[] | select(.id == ($run_id | tonumber)) | .jobs["ci"]?.conclusion // empty' 2>/dev/null) || {
                   # Wenn jobs Feld nicht existiert, wir akzeptieren "skipped" als ok für cross-platform releases
@@ -234,14 +231,15 @@ jobs:
           echo "Extracted version from tag: $VERSION"
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
       
-      # --- Version Consistency Check (Info-only) ---
-      - name: Validate Version Consistency (Info Only)
+      # --- Version Consistency Check (FAIL bei Mismatch) ---
+      - name: Validate Version Consistency (MISMATCH = FAIL)
         if: steps.ci-status.outputs.CI_CONCLUSION == 'success'
         id: version-validation
         run: |
           TAG="${{ github.ref_name }}"
           VERSION_TAG="${TAG#v}"
           
+          # Cargo Workspace Version aus Root Cargo.toml
           CARGO_VERSION=$(grep -E '^version\s*=\s*"' Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/') || {
             echo "⚠️ Could not read Cargo version from Cargo.toml"
           }
@@ -250,11 +248,18 @@ jobs:
           echo "Cargo workspace version: $CARGO_VERSION"
           
           if [ "$VERSION_TAG" != "$CARGO_VERSION" ]; then
-            echo "⚠️  Version discrepancy detected!"
+            echo ""
+            echo "❌ VERSION MISMATCH DETECTED!"
             echo "   Tag:      $VERSION_TAG"
             echo "   Cargo:     $CARGO_VERSION"
             echo ""
-            echo "Note: This is informational only. Release proceeds with tag version."
+            echo "A release can only be created when the Git tag version matches the Cargo package version."
+            echo "This prevents releasing production code with incorrect version numbers."
+            echo ""
+            echo "Note: Automatic version synchronization is intentionally disabled to prevent:"
+            echo "  - Accidental commits during release process"
+            echo "  - Breaking changes to production code"
+            exit 1
           else
             echo "✅ Version consistency verified"
           fi
@@ -266,9 +271,8 @@ jobs:
         run: |
           TAG="${{ github.ref_name }}"
           
-          RELEASE_EXISTS=$(curl -s \
+          RELEASE_EXISTS=$(GH_TOKEN="$GH_TOKEN" curl -s \
             -H "Accept: application/vnd.github.v3+json" \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
             | jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id' 2>/dev/null || echo "")
           
@@ -281,9 +285,9 @@ jobs:
             echo "SKIP_REASON=" >> $GITHUB_OUTPUT
           fi
       
-      # --- Create GitHub Release (nur wenn CI=success und Release existiert nicht) ---
+      # --- Create GitHub Release (nur wenn CI=success, Version matcht, und Release existiert nicht) ---
       - name: Create GitHub Release
-        if: steps.ci-status.outputs.CI_CONCLUSION == 'success' && steps.release-check.outputs.RELEASING == 'true'
+        if: steps.ci-status.outputs.CI_CONCLUSION == 'success' && steps.version-validation.result == 'success' && steps.release-check.outputs.RELEASING == 'true'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.ref_name }}
