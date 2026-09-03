@@ -1,4 +1,4 @@
-# PromptForge — GitHub Release Automation Workflow
+# PromptForge — GitHub Release Automation Workflow (Repaired CI Gate)
 #
 # Automatisch GitHub Release aus Git Tag vMAJOR.MINOR.PATCH erzeugen
 # nach erfolgreicher CI-Validierung
@@ -16,6 +16,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: read  # Erforderlich für GitHub Actions API Zugriffe auf CI-Runs
 
 jobs:
   # --- Haupt-Release-Gate (deterministisch, Blocking) ---
@@ -28,64 +29,222 @@ jobs:
         with:
           fetch-depth: 0
       
-      # --- CI-GATE: Der Tag-Commit muss CI-bestanden haben ---
-      - name: Check Last CI Run for this Commit (GitHub API)
+      # --- CI-GATE: Der Tag-Commit muss CI-bestanden haben (Robustes Polling) ---
+      - name: Check CI Status for Release Gate (with polling and timeout)
         id: ci-status
         run: |
+          set -euo pipefail
+          
           echo "=== Checking CI Status for Release Gate ==="
+          echo ""
+          echo "Commit: ${{ github.sha }}"
+          echo "Workflow: ci.yml"
+          echo ""
           
           TAG="${{ github.ref_name }}"
           COMMIT_SHA="${{ github.sha }}"
+          REPO="${{ github.repository }}"
           
-          # GitHub API Call für Workflow-Status dieses Commits
-          CI_RUN_NUMBER=$(curl -s \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs?event=push&per_page=10" \
-            | jq -r --arg sha "$COMMIT_SHA" '.[] | select(.head_sha == $sha and .event == "push") | .database_id' 2>/dev/null)
+          MAX_ATTEMPTS=60        # Max 10 Minuten (20s * 60)
+          ATTEMPT=1
+          SLEEP_INTERVAL=20       # Sekunden zwischen Polling-Runden
           
-          if [ -n "$CI_RUN_NUMBER" ]; then
-            CI_CONCLUSION=$(curl -s \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/runs/$CI_RUN_NUMBER" \
-              | jq -r '.conclusion' 2>/dev/null)
+          # GitHub API Token von Umgebungsvariable oder Secrets
+          GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN:-}}"
+          
+          # Funktion: CI-Run für diesen Commit finden
+          find_ci_run() {
+            local response
+            local run_id
             
-            echo "Latest CI conclusion for this commit: $CI_CONCLUSION"
-          else
-            echo "⚠️ No prior CI run found for this commit — releasing anyway (CI gate bypassed)"
-            CI_CONCLUSION="success"
-          fi
+            response=$(curl -s \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/$REPO/actions/runs?event=push&per_page=100" 2>/dev/null) || return 1
+            
+            run_id=$(echo "$response" | jq -r --arg sha "$COMMIT_SHA" \
+              '.[] | select(.head_sha == $sha and .name != null)' \
+              '.id // empty' 2>/dev/null) || return 1
+            
+            if [ -n "$run_id" ]; then
+              echo "$run_id"
+              return 0
+            fi
+            return 1
+          }
           
-          echo "CI_CONCLUSION=$CI_CONCLUSION" >> $GITHUB_OUTPUT
-      
-      - name: Validate CI Gate Passed
-        if: steps.ci-status.outputs.CI_CONCLUSION != 'success' && steps.ci-status.outputs.CI_CONCLUSION != 'skipped'
-        run: |
-          CI_CONCLUSION="${{ steps.ci-status.outputs.CI_CONCLUSION }}"
+          # Funktion: CI-Run Details holen
+          get_run_conclusion() {
+            local run_id="$1"
+            
+            if [ -z "$run_id" ]; then
+              echo ""
+              return 1
+            fi
+            
+            curl -s \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/$REPO/actions/runs/$run_id" \
+              | jq -r '.conclusion // empty' 2>/dev/null || echo ""
+          }
           
-          echo "FATAL: CI did not succeed for this commit (conclusion: $CI_CONCLUSION)"
-          echo "Releases can only be created after successful CI validation."
-          echo "Please fix CI failures before creating a release."
-          exit 1
-      
+          # Funktion: CI-Run Status Details holen
+          get_run_status() {
+            local run_id="$1"
+            
+            if [ -z "$run_id" ]; then
+              echo "not_found"
+              return 1
+            fi
+            
+            curl -s \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/$REPO/actions/runs/$run_id" \
+              | jq -r '.status // empty' 2>/dev/null || echo "unknown"
+          }
+          
+          # Polling-Loop
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "---"
+            echo "CI Gate Check — Attempt: $ATTEMPT/$MAX_ATTEMPTS"
+            
+            CI_RUN=$(find_ci_run) || {
+              if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+                echo ""
+                echo "❌ CI GATE TIMEOUT: No successful ci.yml run found for commit $COMMIT_SHA within ${MAX_ATTEMPTS} attempts (${MAX_ATTEMPTS} * ${SLEEP_INTERVAL}s = ~${(( MAX_ATTEMPTS / 2 ))} minutes)"
+                echo "CI runs may not have finished yet or CI workflow has issues."
+                exit 1
+              else
+                echo "⚠️ CI run for this commit not found yet — waiting ${SLEEP_INTERVAL}s (Race Condition? Push triggered both workflows simultaneously?)"
+                echo ""
+                ATTEMPT=$((ATTEMPT + 1))
+                sleep $SLEEP_INTERVAL
+                continue
+              fi
+            }
+            
+            echo "CI run found:"
+            echo "  ID: $CI_RUN"
+            
+            # Run-Details holen (Status kann sich ändern)
+            RUN_STATUS=$(get_run_status "$CI_RUN")
+            CI_CONCLUSION=$(get_run_conclusion "$CI_RUN")
+            
+            echo "  Status: $RUN_STATUS"
+            echo "  Conclusion: $CI_CONCLUSION"
+            
+            # URLs für Diagnostics
+            RUN_URL="https://github.com/${REPO}/actions/runs/${CI_RUN}"
+            echo "  URL: $RUN_URL"
+            
+            case "$CI_CONCLUSION" in
+              "success")
+                echo ""
+                echo "✅ CI GATE: PASS"
+                echo "   workflow: ci.yml"
+                echo "   commit: $COMMIT_SHA"
+                echo "   run: $CI_RUN"
+                echo "   conclusion: success"
+                echo ""
+                echo "Release gate opened — proceeding with release creation."
+                
+                echo "CI_CONCLUSION=success" >> $GITHUB_OUTPUT
+                echo "CI_RUN_ID=$CI_RUN" >> $GITHUB_OUTPUT
+                echo "CI_RUN_URL=$RUN_URL" >> $GITHUB_OUTPUT
+                ;;
+              
+              "failure"|"cancelled"|"timed_out")
+                echo ""
+                echo "❌ CI GATE: FAIL"
+                echo "   workflow: ci.yml"
+                echo "   commit: $COMMIT_SHA"
+                echo "   run: $CI_RUN"
+                echo "   conclusion: $CI_CONCLUSION"
+                echo ""
+                echo "Releases can only be created after successful CI validation."
+                exit 1
+                ;;
+              
+              "skipped"|"neutral")
+                echo ""
+                echo "⚠️ CI GATE: SKIPPED/NEUTRAL"
+                echo "   workflow: ci.yml"
+                echo "   commit: $COMMIT_SHA"
+                echo "   run: $CI_RUN"
+                echo "   conclusion: $CI_CONCLUSION"
+                echo ""
+                
+                # Skipped ist ok für macOS-only Jobs, aber wir müssen sicherstellen, dass Linux CI success war
+                # Wir prüfen den Job-Status genauer
+                JOB_STATUS=$(echo "$response" | jq -r --arg run_id "$CI_RUN" \
+                  '.[] | select(.id == ($run_id | tonumber)) | .jobs["ci"]?.conclusion // empty' 2>/dev/null) || {
+                  # Wenn jobs Feld nicht existiert, wir akzeptieren "skipped" als ok für cross-platform releases
+                  echo "⚠️ Could not determine specific job status — proceeding cautiously"
+                }
+                
+                if [ "$JOB_STATUS" = "success" ]; then
+                  echo "✅ Linux CI job succeeded — release gate opened"
+                  echo "CI_CONCLUSION=success" >> $GITHUB_OUTPUT
+                elif [ "$JOB_STATUS" = "skipped" ] || [ -z "$JOB_STATUS" ]; then
+                  echo "⚠️ No Linux CI run found or skipped — skipping release (cross-platform requirement)"
+                  exit 0  # Kein Release, aber auch kein Fehler
+                else
+                  echo "❌ CI job failed: $JOB_STATUS"
+                  exit 1
+                fi
+                ;;
+              
+              "")
+                if [ "$RUN_STATUS" = "completed" ]; then
+                  # Run completed aber conclusion ist leer — etwas seltsam, behandeln wie failure
+                  echo ""
+                  echo "⚠️ CI run completed but no conclusion available — treating as failure for safety"
+                  exit 1
+                else
+                  # In progress/queued/waiting — weiter warten (handled in next iteration)
+                  echo "⚠️ Run status: $RUN_STATUS — waiting for completion"
+                  echo ""
+                  ATTEMPT=$((ATTEMPT + 1))
+                  sleep $SLEEP_INTERVAL
+                  continue
+                fi
+                ;;
+              
+              *)
+                echo ""
+                echo "⚠️ Unknown CI conclusion: $CI_CONCLUSION (status: $RUN_STATUS)"
+                echo "This may indicate an API inconsistency or race condition."
+                ATTEMPT=$((ATTEMPT + 1))
+                sleep $SLEEP_INTERVAL
+                continue
+                ;;
+            esac
+          done
+
+      # --- Version Extract (wird erst nach CI-Gate ausgeführt) ---
       - name: Extract Tag Version
+        if: steps.ci-status.outputs.CI_CONCLUSION == 'success'
         id: tag-version
         run: |
           TAG="${{ github.ref_name }}"
-          # Remove leading 'v' and extract version components
           VERSION="${TAG#v}"
           
           echo "Extracted version from tag: $VERSION"
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
       
-      # --- Version Validierung: Tag muss mit Cargo-Version übereinstimmen (optionaler Warn-Check) ---
+      # --- Version Consistency Check (Info-only) ---
       - name: Validate Version Consistency (Info Only)
+        if: steps.ci-status.outputs.CI_CONCLUSION == 'success'
         id: version-validation
         run: |
           TAG="${{ github.ref_name }}"
-          VERSION_TAG="${TAG#v}"  # Remove 'v' prefix
+          VERSION_TAG="${TAG#v}"
           
-          # Cargo Workspace Version aus Root Cargo.toml
-          CARGO_VERSION=$(grep -E '^version\s*=\s*"' Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+          CARGO_VERSION=$(grep -E '^version\s*=\s*"' Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/') || {
+            echo "⚠️ Could not read Cargo version from Cargo.toml"
+          }
           
           echo "Tag version: $VERSION_TAG"
           echo "Cargo workspace version: $CARGO_VERSION"
@@ -96,33 +255,35 @@ jobs:
             echo "   Cargo:     $CARGO_VERSION"
             echo ""
             echo "Note: This is informational only. Release proceeds with tag version."
-            echo "Automatic version synchronization is intentionally disabled to prevent:"
-            echo "  - Accidental commits during release process"
-            echo "  - Breaking changes to production code"
           else
             echo "✅ Version consistency verified"
           fi
       
+      # --- Duplicate Check (Release existiert schon?) ---
       - name: Check if Release Already Exists
+        if: steps.ci-status.outputs.CI_CONCLUSION == 'success'
         id: release-check
         run: |
           TAG="${{ github.ref_name }}"
           
-          # Prüfen ob Release mit diesem Tag schon existiert (GitHub API)
           RELEASE_EXISTS=$(curl -s \
+            -H "Accept: application/vnd.github.v3+json" \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=10" \
-            | jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id' 2>/dev/null)
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
+            | jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id' 2>/dev/null || echo "")
           
           if [ -n "$RELEASE_EXISTS" ]; then
             echo "⚠️ Release already exists for tag: $TAG (ID: $RELEASE_EXISTS)"
-            exit 0  # Keine Fehler — Release wird übersprungen
+            echo "SKIP_REASON=release_already_exists" >> $GITHUB_OUTPUT
           else
             echo "✅ No existing release found for this tag"
-            exit 1
+            echo "RELEASING=true" >> $GITHUB_OUTPUT
+            echo "SKIP_REASON=" >> $GITHUB_OUTPUT
           fi
       
+      # --- Create GitHub Release (nur wenn CI=success und Release existiert nicht) ---
       - name: Create GitHub Release
+        if: steps.ci-status.outputs.CI_CONCLUSION == 'success' && steps.release-check.outputs.RELEASING == 'true'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.ref_name }}
