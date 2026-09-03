@@ -1,0 +1,23 @@
+[package]
+name = "pf-cli"
+description = "PromptForge CLI binary `prompt-forge`"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "prompt-forge"
+path = "src/main.rs"
+
+[dependencies]
+pf-core = { workspace = true }
+pf-engine = { workspace = true }
+pf-bridge = { workspace = true }
+pf-tui = { workspace = true }
+pf-service = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]

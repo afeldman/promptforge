@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pf-core",
+    "crates/pf-engine",
+    "crates/pf-bridge",
+    "crates/pf-cli",
+    "crates/pf-tui",
+    "crates/pf-service",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+
+[workspace.dependencies]
+pf-core = { path = "crates/pf-core", version = "0.1.0" }
+pf-engine = { path = "crates/pf-engine", version = "0.1.0" }
+pf-bridge = { path = "crates/pf-bridge", version = "0.1.0" }
+pf-tui = { path = "crates/pf-tui", version = "0.1.0" }
+pf-service = { path = "crates/pf-service", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"

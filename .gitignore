@@ -1,0 +1,29 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Python / uv
+python/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Local runtime data
+.pf-home/
+*.log
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets (never commit)
+.env
+.env.local
+
+# Cargo.lock ist für die Binary/App zu committen (reproduzierbare Builds).

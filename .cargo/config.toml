@@ -1,0 +1,8 @@
+# Hinweis PyO3: Das Python, gegen das Rust baut/embedded, wird über die
+# Umgebungsvariable PYO3_PYTHON gewählt (z. B. das uv-Venv oder Homebrew):
+#
+#   export PYO3_PYTHON="$(pwd)/python/.venv/bin/python"   # nach `uv venv`
+#   export PYO3_PYTHON=/opt/homebrew/bin/python3.14       # Homebrew-Fallback
+#
+# Ohne PYO3_PYTHON fällt pyo3 auf `python3` aus dem PATH zurück (Vorsicht:
+# system python3 = 3.9). Siehe README → Development Setup.
