@@ -38,7 +38,17 @@ sinnvolle Annahmen in assumptions.
 Leite konkrete constraints aus dem Kontext ab und trage sie ein (mindestens
 2, z. B. Evidenzpflicht, keine erfundenen Befunde, Sprache/Umfang,
 Qualitäts-/Sicherheitsregeln). Schreibe jeden Arbeitsschritt unter procedure
-als ausführbare Anweisung — nicht als Beschreibung."""
+als ausführbare Anweisung — nicht als Beschreibung.
+
+Längenregeln (Output-Limit-Schutz):
+- Halte jeden Listeneintrag kurz und präzise (Ziel unter ~12 Wörter).
+- Fülle KEINE Felder mit Erklärungen, Begründungen oder Wiederholungen.
+- Schreibe keine Einleitung, keinen Epilog, keinen Kommentar.
+- Das JSON endet exakt mit dem schließenden } — nichts danach.
+
+Vollständigkeit:
+- Lasse KEINES der Schema-Felder weg (leere Liste erlaubt, wo sinnvoll).
+- Fasse mehrere Ziele/Constraints NICHT in einem Eintrag zusammen."""
 
 OPTIMIZE_SYSTEM = """Du bist der Prompt-Optimizer von PromptForge.
 

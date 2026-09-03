@@ -172,3 +172,23 @@ Verschlechterung). Der Report erscheint identisch im Debug-Trace-Dokument
 CLI: `compile --optimizer auto|baseline|redundancy|instruction|structural|semantic|combined`
 (Default `auto`). Kein Breaking Change — strukturierte Antworten ohne Engine-
 Report sind weiterhin gültig (Feld fehlt dann einfach).
+
+## Fehlerklassen der LLM-Antworten (Repair CI/apfel)
+
+Fehler beim Parsen von Architect-/Verify-Antworten sind seit der Repair-Phase
+diagnostisch klassifiziert und erscheinen im `error.message`:
+
+```text
+empty response      — Provider lieferte keinen Inhalt
+invalid JSON        — Inhalt ist kein JSON (Parse-Fehler)
+truncated JSON      — JSON bricht vor dem Abschluss ab („… appears truncated
+                      before valid JSON completion“, ggf. finish_reason=length)
+schema violation    — valides JSON, aber falsche Struktur (kein Objekt)
+```
+
+Ein begrenzter Retry (max. 1 zusätzlicher Request, im Trace als Note +
+`attempt: 2` sichtbar) erfolgt NUR bei reparablen Fehlern (invalid JSON,
+schema violation). Bei Truncation/empty response gibt es KEINEN Retry — die
+Ursache liegt im Output-Limit (siehe `LLM_MAX_TOKENS`), ein identischer
+zweiter Call würde wieder kappen. Es wird niemals ein abgeschnittener JSON-
+Output repariert oder als PASS gemeldet.

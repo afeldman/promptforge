@@ -261,7 +261,35 @@ impl Engine {
         Self::emit(&mut cb, StageEvent::StageStarted(Stage::Architect));
         let ir = if self.llm_on() {
             let payload = serde_json::json!({ "intent": intent });
-            let resp = self.call(LlmOperation::Architect, payload, &request_id, 1, &mut cb)?;
+            // Begrenzter Retry NUR bei reparablen Architect-Fehlern (invalid
+            // JSON / schema violation durch Modellvarianz). KEIN Retry bei
+            // Truncation oder empty response — dort liegt die Ursache im
+            // Output-/Provider-Limit, ein weiterer identischer Call würde
+            // wieder kappen (Repair CI/apfel).
+            let resp = match self.call(
+                LlmOperation::Architect,
+                payload.clone(),
+                &request_id,
+                1,
+                &mut cb,
+            ) {
+                Ok(r) => r,
+                Err(e)
+                    if e.kind == ErrorKind::Model
+                        && (e.message.contains("invalid JSON")
+                            || e.message.contains("schema violation")) =>
+                {
+                    Self::emit(
+                        &mut cb,
+                        StageEvent::Note(format!(
+                            "Architect-Parsing-Fehler ({}): ein erneuter Versuch",
+                            &e.message[..e.message.len().min(120)]
+                        )),
+                    );
+                    self.call(LlmOperation::Architect, payload, &request_id, 2, &mut cb)?
+                }
+                Err(e) => return Err(e),
+            };
             parse_ir(&resp, "Architect")?
         } else {
             PromptIr::from_intent_basic(intent, &request_id)
@@ -1015,5 +1043,90 @@ mod tests {
         assert!(rep["optimization_status"].is_string());
         assert!(rep["candidates"].is_array());
         assert!(!rep["candidates"].as_array().unwrap().is_empty());
+    }
+
+    // ---- Repair CI/apfel: Architect-Retry-Verhalten (begrenzt, kein Fake-PASS) ----
+
+    /// Liefert beim ersten Architect-Call einen reparablen Fehler (invalid
+    /// JSON) oder immer einen Truncation-Fehler — je nach Konfiguration.
+    struct FlakyArchitect {
+        inner: MockBridge,
+        calls: std::sync::atomic::AtomicU32,
+        fail_first_invalid: bool,
+    }
+
+    impl FlakyArchitect {
+        fn invalid_once(inner: MockBridge) -> Self {
+            Self {
+                inner,
+                calls: std::sync::atomic::AtomicU32::new(0),
+                fail_first_invalid: true,
+            }
+        }
+        fn always_truncated(inner: MockBridge) -> Self {
+            Self {
+                inner,
+                calls: std::sync::atomic::AtomicU32::new(0),
+                fail_first_invalid: false,
+            }
+        }
+    }
+
+    impl pf_core::bridge::LlmBridge for FlakyArchitect {
+        fn complete(
+            &self,
+            req: &pf_core::bridge::LlmRequest,
+        ) -> Result<pf_core::bridge::LlmResponse> {
+            if req.operation == pf_core::bridge::LlmOperation::Architect {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if self.fail_first_invalid && n == 1 {
+                    return Err(err(
+                        ErrorKind::Model,
+                        "Architect: invalid JSON (Expecting value: line 1); Antwort beginnt: 'x'",
+                    ));
+                }
+                if !self.fail_first_invalid {
+                    return Err(err(
+                        ErrorKind::Model,
+                        "Architect response appears truncated before valid JSON completion (letztes Zeichen '[')",
+                    ));
+                }
+            }
+            self.inner.complete(req)
+        }
+    }
+
+    #[test]
+    fn architect_invalid_json_is_retried_once_and_recovers() {
+        let engine = Engine::new(
+            Box::new(FlakyArchitect::invalid_once(MockBridge::new())),
+            Arc::new(pf_core::HeuristicTokenizer),
+            cfg(),
+            ProviderKind::Mock,
+        );
+        let outcome = engine.compile("auditiere das projekt", None).unwrap();
+        assert!(!outcome.prompt_ir.task.is_empty());
+        assert_eq!(outcome.verification.verdict, Some(Verdict::Pass));
+        // Genau ein zusätzlicher Versuch ist erlaubt; der Erfolg belegt,
+        // dass der zweite Request valide war (kein Endlos-Loop).
+    }
+
+    #[test]
+    fn architect_truncation_is_not_retried() {
+        let engine = Engine::new(
+            Box::new(FlakyArchitect::always_truncated(MockBridge::new())),
+            Arc::new(pf_core::HeuristicTokenizer),
+            cfg(),
+            ProviderKind::Mock,
+        );
+        let e = engine.compile("auditiere das projekt", None).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Model);
+        assert!(
+            e.message.contains("truncated"),
+            "Truncation muss als solche gemeldet werden: {}",
+            e.message
+        );
+        // Kein Retry bei Truncation — Ursache ist das Output-Limit, kein
+        // zweiter identischer Call (kein Fake-PASS durch Wiederholen).
     }
 }

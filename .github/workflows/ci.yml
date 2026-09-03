@@ -15,9 +15,10 @@ on:
     branches: [master, main]
 
 env:
-  # Python-Version für PyO3 (exakt wie in python/.venv)
-  PYO3_PYTHON: python/.venv/bin/python
-  
+  # Python-Version für PyO3 (exakt wie in python/.venv). Absolut über
+  # github.workspace — kein impliziter, cwd-abhängiger Pfad.
+  PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
+
   # Rust Toolchain (aus Cargo.toml: rust-version = "1.98")
   RUST_VERSION: 1.98
 
@@ -51,14 +52,41 @@ jobs:
           cd python
           uv sync --frozen
         env:
-          UV_PROJECT_ENVIRONMENT: .venv
+          UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/python/.venv
       
-      - name: Verify Python Version for PyO3
+      - name: Verify Python Binary Exists and Version
         run: |
-          echo "=== Verifying Python version used by PyO3 ==="
-          .venv/bin/python --version
-        working-directory: python
-        
+          echo "=== Verifying Python binary used by PyO3 ==="
+          
+          # Absolute Python path validation (PyO3 expects github.workspace/python/.venv/bin/python)
+          PYTHON_BIN="${{ github.workspace }}/python/.venv/bin/python"
+          
+          if [ ! -x "$PYTHON_BIN" ]; then
+            echo "FATAL: Python binary not found at expected path: $PYTHON_BIN"
+            echo "PyO3 requires a valid Python interpreter at the configured PATH before build."
+            echo "Please run locally: uv sync --frozen (with UV_PROJECT_ENVIRONMENT pointing to .venv)"
+            exit 1
+          fi
+          
+          # Version check (early failure if broken)
+          "$PYTHON_BIN" --version || {
+            echo "FATAL: Python binary exists but reports no version"
+            exit 1
+          }
+          
+          # Detailed info dump for debugging truncation/encoding issues
+          echo "=== Python interpreter details ==="
+          "$PYTHON_BIN" -c 'import sys; print("Executable:", sys.executable); print("Version:", sys.version)' || {
+            echo "FATAL: Python interpreter cannot execute code"
+            exit 1
+          }
+          
+          # Report for CI visibility
+          echo ""
+          echo "=== PyO3 Python Configuration ==="
+          echo "PYO3_PYTHON: ${{ env.PYO3_PYTHON }}"
+          echo "Python version: $(python -c 'import sys; print(sys.version.split()[:1])')"
+          
       # Dependencies installieren (exakt wie `make setup-python`)
       - name: Install Rust Dependencies (cargo)
         run: cargo fetch
@@ -80,9 +108,8 @@ jobs:
         run: cd python && uv run pytest --tb=short
         
       # --- Release Build (PyO3 gegen die venv-Python-Version bauen) ---
+      # PYO3_PYTHON kommt aus dem Job-Env (absoluter Pfad, siehe oben).
       - name: Release Build (cargo build --release)
-        env:
-          PYO3_PYTHON: python/.venv/bin/python
         run: cargo build --release
       
       - name: Verify Binary Exists
@@ -151,13 +178,28 @@ jobs:
           cd python
           uv sync --frozen
         env:
-          UV_PROJECT_ENVIRONMENT: .venv
+          UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/python/.venv
       
-      - name: Verify Python Version for PyO3 (macOS)
+      - name: Verify Python Binary Exists and Version (macOS)
         run: |
-          echo "=== macOS Apple Silicon Detected ==="
-          .venv/bin/python --version
-        working-directory: python
+          echo "=== Verifying Python binary used by PyO3 (macOS) ==="
+          
+          # Absolute Python path validation (PyO3 expects github.workspace/python/.venv/bin/python)
+          PYTHON_BIN="${{ github.workspace }}/python/.venv/bin/python"
+          
+          if [ ! -x "$PYTHON_BIN" ]; then
+            echo "FATAL: Python binary not found at expected path: $PYTHON_BIN"
+            echo "PyO3 requires a valid Python interpreter at the configured PATH before build."
+            exit 1
+          fi
+          
+          # Version check (early failure if broken)
+          "$PYTHON_BIN" --version || {
+            echo "FATAL: Python binary exists but reports no version"
+            exit 1
+          }
+          
+          echo "Python version verified successfully"
       
       # apfel installieren (nur auf macOS)
       - name: Install apfel (macOS only)
@@ -170,11 +212,17 @@ jobs:
         run: |
           apfel --version || echo "SKIP: apfel nicht installiert (Integrationstest wird übersprungen)"
         
+      # --- Release Build (PyO3 gegen die venv-Python-Version bauen) ---
+      # Der Apfel-Job testet das echte Release-Binary; ohne Build schlüge
+      # smoke.sh immer mit „release binary not found" fehl.
+      - name: Release Build (cargo build --release)
+        run: cargo build --release
+        
       # --- Apple Integration Test (separat vom deterministischen CI) ---
+      # Optionaler Job: continue-on-error erlaubt dokumentierte Modellvarianz,
+      # ohne das deterministische Gate zu berühren.
       - name: Apple Foundation Integration Test
         if: runner.os == 'macOS'
-        env:
-          PYO3_PYTHON: python/.venv/bin/python
         run: |
           # Nur ausführen, wenn apfel installiert ist
           if command -v apfel >/dev/null 2>&1; then

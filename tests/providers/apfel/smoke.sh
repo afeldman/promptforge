@@ -186,7 +186,12 @@ ok "chat completion erfolgreich"
 export LLM_ENDPOINT="${APFEL_ENDPOINT}"
 export LLM_MODEL="${MODEL}"
 export LLM_KEY=""          # apfel benötigt keinen Key; ererbte Keys neutralisieren
+# Output-Limit explizit setzen: Apple Foundation Model kappt Antworten ohne
+# max_tokens am Server-Default (Root Cause der Architect-Truncation).
+# 3072 bleibt unter dem 4096er-Kontext und erlaubt vollständige IRs.
+export LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-3072}"
 unset PF_PROVIDER
+ok "LLM_MAX_TOKENS=${LLM_MAX_TOKENS} (explizites Output-Limit gegen Truncation)"
 
 # --- 8. Echter PromptForge-Durchlauf (kein Mock, kein --no-llm) ---
 START_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"

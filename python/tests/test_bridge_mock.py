@@ -92,5 +92,87 @@ class BridgeHelpersTests(unittest.TestCase):
         self.assertEqual(_req_json('{"a": 1}')["a"], 1)
 
 
+# --- Repair CI/apfel: Architect-Response-Contract (Truncation-Diagnostik) ---
+# Echte Python-Bridge-Pfade (op_architect/op_verify), nur der Provider-Chat
+# wird gepatched — Rust→Python→Provider→Python→Rust bleibt echt getestet.
+
+import promptforge.bridge as bridge
+from unittest import mock
+
+
+def _chat_result(content, finish_reason=None):
+    return {"content": content, "finish_reason": finish_reason, "model": "test", "usage": None}
+
+
+def _architect_request_with_chat(content, finish_reason=None):
+    payload = json.dumps({"intent": "auditiere das projekt"}, ensure_ascii=False)
+    with mock.patch.object(bridge.llm_provider, "chat", return_value=_chat_result(content, finish_reason)) as m:
+        out = json.loads(handle_request(make_request("architect", provider="auto", user_prompt=payload)))
+    return out, m
+
+
+class ArchitectResponseContractTests(unittest.TestCase):
+    def test_valid_json_becomes_ir(self):
+        content = json.dumps(
+            {"schema_version": 1, "task": "Auditiere das Projekt", "objective": ["Risiken finden"],
+             "constraints": [], "procedure": ["Struktur prüfen"], "output_contract": {"format": "markdown"},
+             "verification_requirements": [], "metadata": {}}, ensure_ascii=False
+        )
+        out, _ = _architect_request_with_chat(content)
+        self.assertTrue(out["ok"], out)
+        ir = json.loads(out["content"])
+        self.assertEqual(ir["task"], "Auditiere das Projekt")
+
+    def test_truncated_json_diagnosed(self):
+        content = '{"schema_version":"1","task":"audit","objective":["a","b"],"procedure":["x",'
+        out, _ = _architect_request_with_chat(content)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["kind"], "model")
+        self.assertIn("truncated", out["error"]["message"].lower())
+
+    def test_truncated_json_with_finish_reason_length(self):
+        content = '{"schema_version":"1","task":"audit","objective":[' * 1
+        out, _ = _architect_request_with_chat(content, finish_reason="length")
+        self.assertFalse(out["ok"])
+        self.assertIn("finish_reason=length", out["error"]["message"])
+
+    def test_empty_response_diagnosed(self):
+        out, _ = _architect_request_with_chat("")
+        self.assertFalse(out["ok"])
+        self.assertIn("empty response", out["error"]["message"])
+
+    def test_schema_violation_diagnosed(self):
+        out, _ = _architect_request_with_chat('["kein", "objekt"]')
+        self.assertFalse(out["ok"])
+        self.assertIn("schema violation", out["error"]["message"])
+
+    def test_verify_truncated_diagnosed(self):
+        payload = json.dumps({"atoms": {"constraints": ["c"]}, "long_prompt": "orig", "optimized_prompt": "opt"})
+        with mock.patch.object(bridge.llm_provider, "chat",
+                               return_value=_chat_result('{"semantic_preservation": 0.9, "constraints_preserved": tru')):
+            out = json.loads(handle_request(make_request("verify", provider="auto", user_prompt=payload)))
+        self.assertFalse(out["ok"])
+        self.assertIn("truncated", out["error"]["message"].lower())
+
+    def test_system_and_user_prompt_echoed_on_success(self):
+        content = json.dumps(
+            {"schema_version": 1, "task": "Auditiere", "objective": [], "constraints": [],
+             "procedure": [], "output_contract": {"format": "markdown"}, "verification_requirements": [],
+             "metadata": {}}, ensure_ascii=False
+        )
+        out, m = _architect_request_with_chat(content)
+        self.assertTrue(out["ok"])
+        # Echter Request: System- + User-Prompt wurden tatsächlich gesendet.
+        sent = m.call_args
+        self.assertIsNotNone(sent)
+        msgs = sent.args[0]
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertIn("Prompt-Architect", msgs[0]["content"])
+        self.assertIn("auditiere das projekt", msgs[1]["content"])
+        # Echo im Antwort-JSON (Debug-Trace-Pfad).
+        self.assertIn("system_prompt", out)
+        self.assertIn("user_prompt", out)
+
+
 if __name__ == "__main__":
     unittest.main()

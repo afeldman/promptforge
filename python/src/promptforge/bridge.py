@@ -45,6 +45,40 @@ def _json_clean(text: str) -> str:
     return t
 
 
+def _json_parse_failure(op: str, raw: str, resp: dict, exc: Exception) -> PromptForgeError:
+    """Klassifiziert einen fehlgeschlagenen JSON-Parse eines LLM-Outputs.
+
+    Unterscheidung (Repair CI/apfel): empty response | invalid JSON |
+    truncated JSON | (schema violations werden nach erfolgreichem Parse
+    separat geprüft). Ein abgeschnittener JSON-Output wird NICHT repariert
+    oder geraten — er wird diagnostisch gemeldet; der vollständige Rohtext
+    bleibt über --debug-json verfügbar (redigiert).
+    """
+    stripped = str(raw or "").strip()
+    finish = str(resp.get("finish_reason") or "").strip().lower()
+    if not stripped:
+        return PromptForgeError(
+            "model", f"{op}: empty response (kein Inhalt) — der Provider lieferte keine Antwort"
+        )
+    tail = stripped[-1]
+    length_cut = finish == "length"
+    open_json = stripped.lstrip().startswith("{") or stripped.lstrip().startswith("[")
+    looks_truncated = length_cut or (
+        open_json and not stripped.endswith(("}", "]", '"', "true", "false", "null"))
+    )
+    if looks_truncated:
+        detail = "finish_reason=length" if length_cut else f"letztes Zeichen {tail!r}"
+        return PromptForgeError(
+            "model",
+            f"{op} response appears truncated before valid JSON completion "
+            f"({detail}); Antwort beginnt: {stripped[:160]!r} … endet: {stripped[-80:]!r}",
+        )
+    return PromptForgeError(
+        "model",
+        f"{op}: invalid JSON ({exc}); Antwort beginnt: {stripped[:160]!r} … endet: {stripped[-80:]!r}",
+    )
+
+
 def _req_json(request: str) -> dict:
     try:
         req = json.loads(request)
@@ -226,12 +260,13 @@ def op_architect(req: dict) -> dict:
     try:
         parsed = json.loads(raw)
     except Exception as exc:
-        snippet = str(raw)[:200]
-        raise PromptForgeError(
-            "model", f"Architect lieferte kein JSON (Antwort beginnt: {snippet!r})"
-        ) from exc
+        raise _json_parse_failure("Architect", raw, resp, exc) from exc
     if not isinstance(parsed, dict):
-        raise PromptForgeError("model", "Architect-IR ist kein JSON-Objekt")
+        raise PromptForgeError(
+            "model",
+            "Architect: schema violation — valides JSON, aber kein Objekt "
+            f"(Antwort beginnt: {str(parsed)[:160]!r})",
+        )
     task = str(parsed.get("task") or "").strip()
     if not task:
         # Kleine Modelle antworten manchmal statt zu extrahieren.
@@ -357,10 +392,9 @@ def op_verify(req: dict) -> dict:
     try:
         report = json.loads(raw)
     except Exception as exc:
-        snippet = str(raw)[:200]
-        raise PromptForgeError("model", f"Verify lieferte kein JSON (Antwort beginnt: {snippet!r})") from exc
+        raise _json_parse_failure("Verify", raw, resp, exc) from exc
     if not isinstance(report, dict):
-        raise PromptForgeError("model", "Verify-Antwort ist kein JSON-Objekt")
+        raise PromptForgeError("model", "Verify: schema violation — valides JSON, aber kein Objekt")
     # Robustheit gegen unvollständige Reports kleiner Modelle:
     report.setdefault("semantic_preservation", 0.0)
     report.setdefault("constraints_preserved", False)

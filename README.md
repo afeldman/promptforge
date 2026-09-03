@@ -126,11 +126,18 @@ export LLM_ENDPOINT=https://api.openai.com/v1
 export LLM_KEY=sk-…
 export LLM_MODEL=gpt-4o-mini
 # ohne LLM_ENDPOINT:  export LLM_MODEL=anthropic:claude-…  (+ ANTHROPIC_API_KEY)
+
+# Output-Limit (empfohlen bei lokalen Modellen mit kleinem Default-Limit,
+# z. B. Apple Foundation Model): ohne max_tokens kappen manche Server
+# Antworten mitten im JSON (Architect-Truncation). 3072 liegt unter dem
+# 4096er-Kontext und erlaubt vollständige Prompt-IRs.
+export LLM_MAX_TOKENS=3072
 ```
 
 Weitere Variablen: `PF_HOME`, `PF_PROVIDER` (auto|any_llm|mock|none),
 `PF_LOG_LEVEL`, `PF_LOG_FORMAT` (text|json), `PF_LOG_RETENTION`,
 `PF_PROMPT_LOG` (0|1), `PF_VERIFY_THRESHOLD`, `PF_MAX_ATTEMPTS`,
+`LLM_MAX_TOKENS`, `LLM_TEMPERATURE`, `LLM_TIMEOUT_S`,
 `PF_SERVICE_HOST/PORT`, `PF_PYTHON_PATH`.
 
 `prompt-forge init` legt `~/.prompt-forge/` (config/prompt/history/cache/
