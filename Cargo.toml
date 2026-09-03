@@ -13,6 +13,9 @@ members = [
 version = "0.1.6"
 edition = "2024"
 license = "Apache-2.0"
+authors = ["Paper Guard Contributors"]
+repository = "https://github.com/afeldman/promptforge.git"
+description = "PromptForge: A framework for building and managing prompt-based applications."
 
 [workspace.dependencies]
 pf-core = { path = "crates/pf-core", version = "0.1.0" }
