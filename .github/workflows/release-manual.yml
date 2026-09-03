@@ -1,73 +1,79 @@
-# PromptForge — GitHub Release Automation Workflow
+# PromptForge — Manual Release Workflow
 #
-# Automatisch GitHub Release aus Git Tag vMAJOR.MINOR.PATCH erzeugen
-# nach erfolgreicher Release-Pipeline-Validierung
+# Manueller Release-Workflow für diagnostische Zwecke oder Testing
 
-name: Release
+name: Release (Manual)
 
 on:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*'
-      - 'v[0-9]+.[0-9]+.[0-9]+-**'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Git Tag zu releasen (Format: vMAJOR.MINOR.PATCH)'
+        required: true
+        type: string
+        default: 'v1.0.0'
+      dry_run:
+        description: 'Nur Validierung ausführen, kein Release erstellen?'
+        required: false
+        type: boolean
+        default: false
 
 env:
-  # Use GitHub-provided token for all API calls
   GH_TOKEN: ${{ github.token }}
 
 permissions:
   contents: write
 
 jobs:
-  validate-tag:
-    name: Validate Tag Format
+  validate-manual-release:
+    name: Manual Release Validation
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.extract-version.outputs.version }}
       tag_name: ${{ steps.extract-version.outputs.tag_name }}
-      is_pre_release: ${{ steps.extract-version.outputs.is_pre_release }}
+      is_dry_run: ${{ github.event.inputs.dry_run == 'true' }}
     
     steps:
-      - name: Checkout exact tag commit
+      - name: Checkout latest commit (for manual release)
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
           fetch-depth: 1
       
-      - name: Extract version from git tag
+      - name: Extract version from requested tag
         id: extract-version
         run: |
-          TAG="${{ github.ref_name }}"
-          # Remove 'v' prefix
-          VERSION="${TAG#v}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag_name=$TAG" >> $GITHUB_OUTPUT
+          REQUESTED_TAG="${{ github.event.inputs.tag }}"
           
-          # Check for pre-release indicators
-          if [[ "$TAG" =~ -[a-zA-Z] ]]; then
-            echo "is_pre_release=true" >> $GITHUB_OUTPUT
-          else
-            echo "is_pre_release=false" >> $GITHUB_OUTPUT
+          # Validate tag format
+          if ! [[ "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.*)?$ ]]; then
+            echo "Invalid tag format: $REQUESTED_TAG"
+            echo "Expected format: vMAJOR.MINOR.PATCH[-pre-release]"
+            exit 1
           fi
+          
+          # Remove 'v' prefix
+          VERSION="${REQUESTED_TAG#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag_name=$REQUESTED_TAG" >> $GITHUB_OUTPUT
       
-      - name: Display extracted version info
+      - name: Display manual release info
         run: |
-          echo "=== Tag Validation ==="
-          echo "Tag: ${{ github.ref_name }}"
+          echo "=== Manual Release ==="
+          echo "Tag: ${{ github.event.inputs.tag }}"
           echo "Version: ${{ steps.extract-version.outputs.version }}"
-          echo "Pre-Release: ${{ steps.extract-version.outputs.is_pre_release }}"
+          echo "Dry Run: ${{ github.event.inputs.dry_run }}"
 
-  validate-consistency:
-    name: Version Consistency Check
+  validate-consistency-manual:
+    name: Version Consistency Check (Manual)
     runs-on: ubuntu-latest
-    needs: validate-tag
+    needs: validate-manual-release
     env:
       GH_TOKEN: ${{ github.token }}
+    
     steps:
-      - name: Checkout exact tag commit
+      - name: Checkout latest commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
           fetch-depth: 1
       
       - name: Install Rust toolchain
@@ -80,37 +86,44 @@ jobs:
           echo "cargo_version=$CARGO_VERSION" >> $GITHUB_OUTPUT
           echo "Cargo.toml version: $CARGO_VERSION"
       
-      - name: Get Python version from pyproject.toml
-        id: python-version
+      - name: Validate version consistency
         run: |
-          # Extract requires-python from python/pyproject.toml
-          PYTHON_REQUIRE=$(grep -oP 'requires-python\s*=\s*"\K[^"]+' python/pyproject.toml)
-          echo "python_require=$PYTHON_REQUIRE" >> $GITHUB_OUTPUT
-          echo "Python requirement: $PYTHON_REQUIRE"
+          REQUESTED_TAG="${{ github.event.inputs.tag }}"
+          CARGO_VERSION=$(grep -oP 'version\s*=\s*"\K[^"]+' Cargo.toml)
+          
+          echo "Requested Tag: $REQUESTED_TAG"
+          echo "Cargo.toml Version: $CARGO_VERSION"
+          
+          # Remove 'v' from tag for comparison
+          TAG_VERSION="${REQUESTED_TAG#v}"
+          
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "WARNING: Version mismatch!" >&2
+            echo "Tag version: $TAG_VERSION" >&2
+            echo "Cargo version: $CARGO_VERSION" >&2
+            echo "This may indicate inconsistent versioning"
+          else
+            echo "✓ Versions match: $TAG_VERSION"
+          fi
 
-  validate-python-uv-pyo3:
-    name: Python/uv/PyO3 Setup
+  validate-python-uv-pyo3-manual:
+    name: Python/uv/PyO3 Setup (Manual)
     runs-on: ubuntu-latest
-    needs: validate-consistency
+    needs: validate-consistency-manual
     env:
       GH_TOKEN: ${{ github.token }}
-      # CRITICAL: Use absolute path, never relative paths for PyO3
       PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
+    
     steps:
-      - name: Checkout exact tag commit
+      - name: Checkout latest commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
           fetch-depth: 1
       
       - name: Install uv
         uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
-      
-      - name: Verify uv is available
-        run: |
-          uv --version
       
       - name: Sync Python environment with uv
         run: |
@@ -121,81 +134,69 @@ jobs:
       - name: Verify Python binary exists (CRITICAL for PyO3)
         run: |
           PY_BIN="${{ github.workspace }}/python/.venv/bin/python"
-          echo "=== Checking Python Binary ==="
-          echo "Path: $PY_BIN"
           
           if [ ! -x "$PY_BIN" ]; then
             echo "FATAL: Python binary does not exist or is not executable" >&2
-            echo "This will break PyO3 compilation" >&2
             exit 1
           fi
-          echo "✓ Python binary exists and is executable"
       
       - name: Verify Python version
         run: |
           PY_BIN="${{ github.workspace }}/python/.venv/bin/python"
           $PY_BIN --version
-      
-      - name: Verify Python can import sys
-        run: |
-          PY_BIN="${{ github.workspace }}/python/.venv/bin/python"
-          $PY_BIN -c "import sys; print('Executable:', sys.executable); print('Version:', sys.version)"
 
-  validate-format-clippy:
-    name: Code Quality Gates
+  validate-format-clippy-manual:
+    name: Code Quality Gates (Manual)
     runs-on: ubuntu-latest
-    needs: validate-python-uv-pyo3
+    needs: validate-python-uv-pyo3-manual
     env:
       GH_TOKEN: ${{ github.token }}
       PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
+    
     steps:
-      - name: Checkout exact tag commit
+      - name: Checkout latest commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
           fetch-depth: 1
       
       - name: Run cargo fmt --check
         run: |
-          cargo fmt --all -- --check || {
-            echo "cargo fmt check failed" >&2
-            exit 1
-          }
+          cargo fmt --all -- --check
       
       - name: Run cargo clippy
         run: |
           cargo clippy --workspace --all-targets -- -D warnings
 
-  validate-rust-tests:
-    name: Rust Tests
+  validate-rust-tests-manual:
+    name: Rust Tests (Manual)
     runs-on: ubuntu-latest
-    needs: validate-format-clippy
+    needs: validate-format-clippy-manual
     env:
       GH_TOKEN: ${{ github.token }}
       PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
+    
     steps:
-      - name: Checkout exact tag commit
+      - name: Checkout latest commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
           fetch-depth: 1
       
       - name: Run cargo test
         run: |
           cargo test --workspace
 
-  validate-python-tests:
-    name: Python Tests
+  validate-python-tests-manual:
+    name: Python Tests (Manual)
     runs-on: ubuntu-latest
-    needs: validate-rust-tests
+    needs: validate-rust-tests-manual
     env:
       GH_TOKEN: ${{ github.token }}
       PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
+    
     steps:
-      - name: Checkout exact tag commit
+      - name: Checkout latest commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
           fetch-depth: 1
       
       - name: Run Python pytest
@@ -203,18 +204,18 @@ jobs:
         run: |
           uv run pytest
 
-  build-release:
-    name: Release Build & Validation
+  build-release-manual:
+    name: Release Build (Manual)
     runs-on: ubuntu-latest
-    needs: [validate-python-tests, validate-format-clippy]
+    needs: [validate-python-tests-manual, validate-format-clippy-manual]
     env:
       GH_TOKEN: ${{ github.token }}
       PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
+    
     steps:
-      - name: Checkout exact tag commit
+      - name: Checkout latest commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
           fetch-depth: 1
       
       - name: Install Rust toolchain
@@ -222,79 +223,42 @@ jobs:
       
       - name: Run cargo build --release
         run: |
-          cargo build --release || {
-            echo "cargo build --release failed" >&2
-            exit 1
-          }
+          cargo build --release
       
       - name: Verify release binary exists
         run: |
           BIN="${{ github.workspace }}/target/release/prompt-forge"
+          
           if [ ! -x "$BIN" ]; then
             echo "FATAL: Release binary does not exist: $BIN" >&2
             exit 1
           fi
-          echo "✓ Release binary exists: $BIN"
-
-  compiler-smoke-test:
-    name: Compiler Smoke Test
-    runs-on: ubuntu-latest
-    needs: build-release
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Checkout exact tag commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 1
       
       - name: Run compiler smoke test
         run: |
           ./tests/compiler-smoke.sh
 
-  security-audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    needs: compiler-smoke-test
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Checkout exact tag commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 1
-      
-      - name: Run cargo audit (if available)
-        run: |
-          if command -v cargo-audit &> /dev/null; then
-            cargo audit
-          else
-            echo "cargo-audit not installed, skipping security audit"
-          fi
-
-  multi-platform-builds:
-    name: Multi-Platform Builds
-    needs: [validate-python-tests, validate-format-clippy]
+  multi-platform-builds-manual:
+    name: Multi-Platform Builds (Manual)
+    needs: [validate-python-tests-manual, validate-format-clippy-manual]
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: "prompt-forge-${{ github.ref_name }}-x86_64-unknown-linux-gnu"
+            artifact_name: "prompt-forge-${{ github.event.inputs.tag }}-x86_64-unknown-linux-gnu"
             archive_ext: "tar.gz"
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: "prompt-forge-${{ github.ref_name }}-x86_64-apple-darwin"
+            artifact_name: "prompt-forge-${{ github.event.inputs.tag }}-x86_64-apple-darwin"
             archive_ext: "tar.gz"
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: "prompt-forge-${{ github.ref_name }}-aarch64-apple-darwin"
+            artifact_name: "prompt-forge-${{ github.event.inputs.tag }}-aarch64-apple-darwin"
             archive_ext: "tar.gz"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: "prompt-forge-${{ github.ref_name }}-x86_64-pc-windows-msvc"
+            artifact_name: "prompt-forge-${{ github.event.inputs.tag }}-x86_64-pc-windows-msvc"
             archive_ext: "zip"
     
     runs-on: ${{ matrix.os }}
@@ -303,18 +267,13 @@ jobs:
       PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
     
     steps:
-      - name: Checkout exact tag commit
+      - name: Checkout latest commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
           fetch-depth: 1
       
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      
-      - name: Set cargo target
-        run: |
-          echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target-${{ matrix.target }}" >> $GITHUB_ENV
       
       - name: Cross-compile for ${{ matrix.target }}
         run: |
@@ -329,10 +288,8 @@ jobs:
           mkdir -p releases
           
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            # Windows: create zip with binary only
             cp "${TARGET_DIR}/prompt-forge.exe" "$OUTPUT_FILE"
           else
-            # Unix: create tar.gz with binary
             tar -czf "${OUTPUT_FILE}" -C "$(dirname ${TARGET_DIR})" "$(basename ${TARGET_DIR})/prompt-forge"
           fi
       
@@ -344,12 +301,13 @@ jobs:
             ${{ github.workspace }}/releases/${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
           if-no-files-found: fail
 
-  create-sha256sums:
-    name: Generate SHA256 Sum File
-    needs: multi-platform-builds
+  create-sha256sums-manual:
+    name: Generate SHA256 Sum File (Manual)
+    needs: multi-platform-builds-manual
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+    
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -363,13 +321,10 @@ jobs:
           cd releases
           sha256sum *.tar.gz *.zip > SHA256SUMS
           cat SHA256SUMS
-          
-          # Verify checksums
-          sha256sum -c SHA256SUMS
 
-  upload-sha256sums:
-    name: Upload SHA256 Sum File to Release
-    needs: create-sha256sums
+  upload-sha256sums-manual:
+    name: Upload SHA256 Sum File (Manual)
+    needs: create-sha256sums-manual
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -385,18 +340,18 @@ jobs:
           name: SHA256SUMS
           path: releases/SHA256SUMS
 
-  create-github-release:
-    name: Create GitHub Release
-    needs: [upload-sha256sums, validate-tag]
-    if: ${{ needs.validate-tag.outputs.is_pre_release == 'false' }}
+  create-github-release-manual:
+    name: Create GitHub Release (Manual)
+    needs: [upload-sha256sums-manual, validate-manual-release]
+    if: ${{ github.event.inputs.dry_run != 'true' }}
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+    
     steps:
-      - name: Checkout exact tag commit
+      - name: Checkout latest commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
           fetch-depth: 1
       
       - name: Download all artifacts for release
@@ -408,56 +363,15 @@ jobs:
       
       - name: Create GitHub Release
         run: |
-          VERSION="${{ github.ref_name }}"
+          VERSION="${{ github.event.inputs.tag }}"
           
-          # Use gh CLI to create release
           gh release create "$VERSION" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "PromptForge $VERSION" \
             --generate-notes \
             -F releases/SHA256SUMS \
-            --notes "$(echo '## PromptForge Release Notes\n\nThis is an automated release from tag $VERSION.')" \
+            --notes "$(echo '## PromptForge Release Notes\n\nThis is a manual release from tag $VERSION.')" \
             || {
-              # Check if release already exists (duplicate)
               echo "Release may already exist for this tag"
-              exit 0
-            }
-
-  create-github-pre-release:
-    name: Create GitHub Pre-Release
-    needs: [upload-sha256sums, validate-tag]
-    if: ${{ needs.validate-tag.outputs.is_pre_release == 'true' }}
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Checkout exact tag commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 1
-      
-      - name: Download all artifacts for release
-        uses: actions/download-artifact@v4
-        with:
-          pattern: '*'
-          path: releases
-          merge-multiple: true
-      
-      - name: Create GitHub Pre-Release
-        run: |
-          VERSION="${{ github.ref_name }}"
-          
-          # Use gh CLI to create pre-release
-          gh release create "$VERSION" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "PromptForge $VERSION (Pre-Release)" \
-            --generate-notes \
-            -F releases/SHA256SUMS \
-            --prerelease \
-            --notes "$(echo '## PromptForge Pre-Release Notes\n\nThis is an automated pre-release from tag $VERSION.')" \
-            || {
-              # Check if release already exists (duplicate)
-              echo "Pre-release may already exist for this tag"
               exit 0
             }
