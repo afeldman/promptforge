@@ -6,10 +6,10 @@ import json
 import os
 import time
 
-from . import logging as pylog
+from . import __version__, logging as pylog
 from .errors import PromptForgeError
 from .llm import provider as llm_provider
-from .llm.mock import mock_complete
+from .llm.mock import IR_SCHEMA, mock_complete
 from .prompts import ARCHITECT_SYSTEM, OPTIMIZE_SYSTEM, VERIFY_SYSTEM
 
 
@@ -102,6 +102,99 @@ def _ok(content: str, resp: dict) -> dict:
 
 # --- Operationen ---
 
+def _as_str_or_null(v) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        return s or None
+    # Kleine Modelle liefern manchmal Objekte/Listen statt Strings.
+    return str(v)[:500]
+
+
+def _as_str_list(v) -> list:
+    if isinstance(v, list):
+        out = []
+        for item in v:
+            if isinstance(item, str):
+                out.append(item.strip())
+            elif item is not None:
+                out.append(str(item)[:500])
+        return out
+    if isinstance(v, str):
+        return [v.strip()] if v.strip() else []
+    return []
+
+
+def _normalize_ir(parsed: dict, request_id: str) -> dict:
+    """Füllt fehlende IR-Schlüssel und erzwingt Typen (kleine On-Device-Modelle
+    liefern oft unvollständiges oder typ-inhomogenes JSON)."""
+    base = json.loads(json.dumps(IR_SCHEMA))
+    base.update(parsed)
+    base["schema_version"] = 1
+    base["task"] = str(base.get("task") or "").strip()
+    base["objective"] = _as_str_list(base.get("objective"))
+    base["context"] = _as_str_list(base.get("context"))
+    base["assumptions"] = _as_str_list(base.get("assumptions"))
+    base["procedure"] = _as_str_list(base.get("procedure"))
+    base["verification_requirements"] = _as_str_list(base.get("verification_requirements"))
+    base["role"] = _as_str_or_null(base.get("role"))
+    base["reasoning_strategy"] = _as_str_or_null(base.get("reasoning_strategy"))
+    base["target_model"] = _as_str_or_null(base.get("target_model"))
+
+    # inputs: [{name, description}]
+    inputs = []
+    if isinstance(base.get("inputs"), list):
+        for item in base["inputs"]:
+            if isinstance(item, dict):
+                inputs.append(
+                    {"name": _as_str_or_null(item.get("name")) or "", "description": _as_str_or_null(item.get("description")) or ""}
+                )
+    base["inputs"] = inputs
+
+    # constraints: [{text, severity}]
+    constraints = []
+    if isinstance(base.get("constraints"), list):
+        for item in base["constraints"]:
+            if isinstance(item, dict):
+                sev = str(item.get("severity") or "").lower()
+                constraints.append(
+                    {"text": _as_str_or_null(item.get("text")) or "", "severity": sev if sev in ("required", "recommended") else "required"}
+                )
+    base["constraints"] = constraints
+
+    # examples: [{input, output}]
+    examples = []
+    if isinstance(base.get("examples"), list):
+        for item in base["examples"]:
+            if isinstance(item, dict):
+                examples.append(
+                    {"input": _as_str_or_null(item.get("input")) or "", "output": _as_str_or_null(item.get("output")) or ""}
+                )
+    base["examples"] = examples
+
+    # output_contract
+    oc = base.get("output_contract")
+    if not isinstance(oc, dict):
+        oc = {}
+    oc = {
+        "format": _as_str_or_null(oc.get("format")) or "markdown",
+        "structure": _as_str_list(oc.get("structure")),
+        "rules": _as_str_list(oc.get("rules")),
+        "example": _as_str_or_null(oc.get("example")),
+    }
+    base["output_contract"] = oc
+
+    base["metadata"] = {
+        "request_id": request_id,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source_language": None,
+        "tags": _as_str_list(parsed.get("metadata", {}).get("tags")) if isinstance(parsed.get("metadata"), dict) else [],
+        "engine_version": __version__,
+    }
+    return base
+
+
 def op_architect(req: dict) -> dict:
     intent = req.get("user_prompt") or ""
     try:
@@ -116,17 +209,32 @@ def op_architect(req: dict) -> dict:
     if provider_kind == "mock":
         resp = mock_complete("architect", json.dumps({"intent": str(intent)}, ensure_ascii=False))
     else:
-        messages = [{"role": "system", "content": ARCHITECT_SYSTEM}, {"role": "user", "content": str(intent)}]
+        messages = [
+            {"role": "system", "content": ARCHITECT_SYSTEM},
+            {"role": "user", "content": f"INTENT: {str(intent).strip()}"},
+        ]
         kwargs = _common(req)
         kwargs["provider"] = provider_kind
         resp = llm_provider.chat(messages, **kwargs)
     raw = _json_clean(str(resp.get("content", "")))
     try:
-        ir = json.loads(raw)
+        parsed = json.loads(raw)
     except Exception as exc:
-        raise PromptForgeError("model", f"Architect lieferte kein JSON: {exc}") from exc
-    if not isinstance(ir, dict) or not ir.get("task"):
-        raise PromptForgeError("model", "Architect-IR ohne 'task'-Feld")
+        snippet = str(raw)[:200]
+        raise PromptForgeError(
+            "model", f"Architect lieferte kein JSON (Antwort beginnt: {snippet!r})"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise PromptForgeError("model", "Architect-IR ist kein JSON-Objekt")
+    task = str(parsed.get("task") or "").strip()
+    if not task:
+        # Kleine Modelle antworten manchmal statt zu extrahieren.
+        raise PromptForgeError(
+            "model",
+            "Architect-IR ohne 'task'-Feld — das Modell hat vermutlich nicht extrahiert "
+            f"(Antwort beginnt: {str(parsed)[:120]!r})",
+        )
+    ir = _normalize_ir(parsed, str(req.get("request_id") or ""))
     return _ok(json.dumps(ir, ensure_ascii=False), resp)
 
 
@@ -178,7 +286,22 @@ def op_verify(req: dict) -> dict:
         kwargs = _common(req)
         kwargs["provider"] = provider_kind
         resp = llm_provider.chat(messages, **kwargs)
-    return _ok(str(resp.get("content", "")), resp)
+    raw = _json_clean(str(resp.get("content", "")))
+    try:
+        report = json.loads(raw)
+    except Exception as exc:
+        snippet = str(raw)[:200]
+        raise PromptForgeError("model", f"Verify lieferte kein JSON (Antwort beginnt: {snippet!r})") from exc
+    if not isinstance(report, dict):
+        raise PromptForgeError("model", "Verify-Antwort ist kein JSON-Objekt")
+    # Robustheit gegen unvollständige Reports kleiner Modelle:
+    report.setdefault("semantic_preservation", 0.0)
+    report.setdefault("constraints_preserved", False)
+    report.setdefault("output_contract_preserved", False)
+    report.setdefault("objective_preserved", False)
+    report.setdefault("instructions_preserved", False)
+    report.setdefault("comment", "")
+    return _ok(json.dumps(report, ensure_ascii=False), resp)
 
 
 def op_chat(req: dict) -> dict:

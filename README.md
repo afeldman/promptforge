@@ -42,6 +42,30 @@ python/
 docs/             architecture.md, api.md, ADRs, Phasenberichte
 ```
 
+## Schnellstart mit make (macOS, empfohlen)
+
+Voraussetzungen: macOS mit Apple Silicon, Homebrew, `uv`, Rust (stable).
+Für den apfel-Integrationstest zusätzlich: aktive Apple Intelligence.
+
+```bash
+make setup    # uv sync + Python-Checks; auf macOS: installiert apfel via brew, falls es fehlt
+make verify   # fmt + lint + test + build (+ apfel-Integrationstest auf macOS/arm64)
+```
+
+Auf macOS installiert `make setup` bei fehlendem `apfel` automatisch
+`brew install apfel` — es startet den Server **nicht** (das macht der Test):
+
+```bash
+make build        # cargo build --release → target/release/prompt-forge
+make test-apfel   # tests/providers/apfel/smoke.sh (echter LLM-Pfad, eigener Server-Lifecycle)
+```
+
+Auf Linux/Windows überspringt das Makefile macOS-/apfel-Schritte sauber
+(`make verify` scheitert dort nicht am fehlenden apfel). Einzelheiten:
+`make help`. `make clean` entfernt nur Build-Artefakte (cargo clean) und
+fasst niemals `~/.prompt-forge` oder andere User-Daten an.
+
+
 ## Installation & Entwicklung
 
 Voraussetzungen: Rust ≥ 1.85 (empfohlen: stable), `uv`, Python ≥ 3.11.
