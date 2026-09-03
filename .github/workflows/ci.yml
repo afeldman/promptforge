@@ -16,7 +16,7 @@ on:
 
 env:
   # Python-Version für PyO3 (exakt wie in python/.venv)
-  PYO3_PYTHON: ${{ github.server_os == 'macOS' && 'python/.venv/bin/python' || '.venv/bin/python' }}
+  PYO3_PYTHON: python/.venv/bin/python
   
   # Rust Toolchain (aus Cargo.toml: rust-version = "1.98")
   RUST_VERSION: 1.98
@@ -35,9 +35,10 @@ jobs:
         uses: actions/checkout@v4
         
       - name: Install Rust Toolchain
-        uses: dtolnay/rust-action@v3
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98
+          components: rustfmt, clippy
       
       - name: Install uv (Python Package Manager)
         uses: astral-sh/setup-uv@v3
@@ -81,7 +82,7 @@ jobs:
       # --- Release Build (PyO3 gegen die venv-Python-Version bauen) ---
       - name: Release Build (cargo build --release)
         env:
-          PYO3_PYTHON: .venv/bin/python
+          PYO3_PYTHON: python/.venv/bin/python
         run: cargo build --release
       
       - name: Verify Binary Exists
@@ -136,7 +137,7 @@ jobs:
         uses: actions/checkout@v4
       
       - name: Install Rust Toolchain
-        uses: dtolnay/rust-action@v3
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98
       
@@ -173,7 +174,7 @@ jobs:
       - name: Apple Foundation Integration Test
         if: runner.os == 'macOS'
         env:
-          PYO3_PYTHON: .venv/bin/python
+          PYO3_PYTHON: python/.venv/bin/python
         run: |
           # Nur ausführen, wenn apfel installiert ist
           if command -v apfel >/dev/null 2>&1; then
