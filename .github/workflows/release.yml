@@ -73,18 +73,45 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       
-      - name: Get Cargo version from manifest
+      - name: Get Cargo workspace version via metadata (canonical)
         id: cargo-version
         run: |
-          CARGO_VERSION=$(grep -oP 'version\s*=\s*"\K[^"]+' Cargo.toml)
+          # Use cargo metadata for canonical Workspace version from pf-core (the root crate)
+          # This avoids grep picking up multiple version fields from workspace.dependencies
+          CARGO_VERSION=$(cargo metadata --format-version 1 \
+            | jq -r '.packages[] | select(.name == "pf-core") | .version')
+          
           echo "cargo_version=$CARGO_VERSION" >> $GITHUB_OUTPUT
-          echo "Cargo.toml version: $CARGO_VERSION"
+          echo "Cargo workspace version (from pf-core): $CARGO_VERSION"
       
-      - name: Get Python version from pyproject.toml
+      - name: Validate Cargo workspace version format
+        run: |
+          # Ensure we have exactly ONE version string, not multiple lines
+          CARGO_VERSION="${{ steps.cargo-version.outputs.cargo_version }}"
+          
+          line_count=$(echo "$CARGO_VERSION" | wc -l)
+          echo "Cargo version line count: $line_count"
+          
+          if [ "$line_count" -ne 1 ]; then
+            echo "ERROR: Cargo version contains multiple lines!" >&2
+            echo "Version string:" >&2
+            echo "$CARGO_VERSION" | cat -A >&2
+            exit 1
+          fi
+          
+          # Validate semver format
+          if ! [[ "$CARGO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "ERROR: Cargo version '$CARGO_VERSION' does not match semver format X.Y.Z" >&2
+            exit 1
+          fi
+          
+          echo "✓ Cargo version is valid and single-line: $CARGO_VERSION"
+      
+      - name: Get Python requirement from pyproject.toml
         id: python-version
         run: |
-          # Extract requires-python from python/pyproject.toml
-          PYTHON_REQUIRE=$(grep -oP 'requires-python\s*=\s*"\K[^"]+' python/pyproject.toml)
+          # Extract requires-python using Python for reliability
+          PYTHON_REQUIRE=$(python3 -c "import tomli; import sys; print(sys.argv[1].get('requires-python', '>=3.8').strip())" python/pyproject.toml 2>/dev/null || grep -oP 'requires-python\s*=\s*"[^"]+"' python/pyproject.toml | sed 's/.*"\([^"]*\)"/\1/')
           echo "python_require=$PYTHON_REQUIRE" >> $GITHUB_OUTPUT
           echo "Python requirement: $PYTHON_REQUIRE"
 
@@ -235,6 +262,26 @@ jobs:
             exit 1
           fi
           echo "✓ Release binary exists: $BIN"
+      
+      - name: Verify Cargo workspace version matches Tag version
+        run: |
+          TAG_VERSION="${{ steps.extract-version.outputs.version }}"
+          
+          # Get Cargo workspace version from pf-core (canonical)
+          CARGO_VERSION=$(cargo metadata --format-version 1 \
+            | jq -r '.packages[] | select(.name == "pf-core") | .version')
+          
+          echo "Tag version: $TAG_VERSION"
+          echo "Cargo version: $CARGO_VERSION"
+          
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "FATAL: Version mismatch!" >&2
+            echo "Tag version ($TAG_VERSION) must match Cargo workspace version ($CARGO_VERSION)" >&2
+            echo "Do NOT modify Cargo.toml automatically. Manual bump required." >&2
+            exit 1
+          fi
+          
+          echo "✓ Tag version matches Cargo workspace version: $CARGO_VERSION"
 
   compiler-smoke-test:
     name: Compiler Smoke Test

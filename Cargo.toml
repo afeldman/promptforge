@@ -10,9 +10,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.6"
 edition = "2024"
-rust-version = "1.98"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 pf-core = { path = "crates/pf-core", version = "0.1.0" }
