@@ -118,6 +118,10 @@ fi
 
 if [ "${MODE}" = "existing" ]; then
     ok "Modus: --existing (laufender apfel-Server wird genutzt, nicht beendet)"
+elif health_body="$(http_get "${BASE_ROOT}/health" 2>/dev/null)"; then
+    # Bereits ein Server erreichbar (z. B. via make apfel-start): keinen
+    # zweiten Server starten, am Ende auch nicht beenden.
+    ok "apfel läuft bereits (${BASE_ROOT}/health) — kein zweiter Server"
 else
     ok "Starte apfel --serve (Hintergrund) …"
     apfel --serve >"${TMP_DIR}/apfel-server.log" 2>&1 &
@@ -206,6 +210,7 @@ model = sys.argv[3]
 tr = d.get("token_report") or {}
 v = d.get("verification") or {}
 stages = d.get("stages") or []
+m = d.get("metrics") or {}
 checks = {
     "llm_used": bool(d.get("llm_used")),
     "architect": "architect" in stages,
@@ -214,6 +219,13 @@ checks = {
     "verify": "verify" in stages,
     "optimized_prompt": bool(d.get("optimized_prompt")),
     "verdict_pass": v.get("verdict") == "pass",
+    # v0.2: CompilationResult-Struktur maschinenlesbar prüfen.
+    "input": bool(d.get("input")),
+    "prompt_ir": bool(d.get("prompt_ir")),
+    "expanded_prompt": bool(d.get("expanded_prompt")),
+    "final_output": bool(d.get("final_output")),
+    "metrics": "semantic_fidelity" in m and "token_efficiency" in m and "structural_validity" in m,
+    "compilation_result_legacy": bool(d.get("ir")) and bool(d.get("long_prompt")),
 }
 missing = [k for k, val in checks.items() if not val]
 if missing:
@@ -242,5 +254,6 @@ ok "Architect erfolgreich"
 ok "Prompt Expansion erfolgreich"
 ok "Optimization erfolgreich"
 ok "Verification erfolgreich"
+ok "CompilationResult vorhanden (input/prompt_ir/expanded_prompt/metrics)"
 ok "finaler Prompt vorhanden"
 echo "PASS: PromptForge ↔ apfel integration"

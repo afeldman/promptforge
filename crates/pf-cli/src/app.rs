@@ -10,7 +10,7 @@ use pf_core::error::{ErrorKind, Result, err};
 use pf_core::ir::PromptIr;
 use pf_core::path::HomeLayout;
 use pf_core::token::HeuristicTokenizer;
-use pf_engine::{CompileOutcome, Engine, EngineConfig, Stage, StageEvent, Verdict};
+use pf_engine::{CompilationResult, Engine, EngineConfig, Stage, StageEvent, Verdict};
 
 /// Ergebnis eines Kompilier-Laufs inkl. optionaler Persistenz.
 #[derive(Debug, Clone)]
@@ -23,7 +23,7 @@ pub struct SaveResult {
 
 #[derive(Debug, Clone)]
 pub struct CompileReport {
-    pub outcome: CompileOutcome,
+    pub outcome: CompilationResult,
     pub saved: Option<SaveResult>,
 }
 
@@ -94,13 +94,17 @@ pub fn compile_and_save(
 }
 
 /// Artefakte + History-Eintrag schreiben.
-pub fn save_outcome(cfg: &AppConfig, outcome: &CompileOutcome) -> Result<SaveResult> {
+pub fn save_outcome(cfg: &AppConfig, outcome: &CompilationResult) -> Result<SaveResult> {
     let layout = HomeLayout::from_root(&cfg.home);
     layout.ensure()?;
-    let ir_json = outcome.ir.to_json()?;
+    let ir_json = outcome.prompt_ir.to_json()?;
     let ir_path = pf_core::persist::save_artifact(&layout.generated_dir, "ir", "json", &ir_json)?;
-    let long_path =
-        pf_core::persist::save_artifact(&layout.generated_dir, "long", "md", &outcome.long_prompt)?;
+    let long_path = pf_core::persist::save_artifact(
+        &layout.generated_dir,
+        "long",
+        "md",
+        &outcome.expanded_prompt,
+    )?;
     let optimized_path = pf_core::persist::save_artifact(
         &layout.optimized_dir,
         "optimized",
@@ -111,10 +115,10 @@ pub fn save_outcome(cfg: &AppConfig, outcome: &CompileOutcome) -> Result<SaveRes
     let entry = pf_core::persist::HistoryEntry {
         request_id: outcome.request_id.clone(),
         created_at: pf_core::path::rfc3339_now(),
-        intent: None,
+        intent: Some(outcome.input.clone()),
         model: cfg.llm.model.clone(),
         token_report: serde_json::to_value(&outcome.token_report).ok(),
-        stages: outcome.stages_done.clone(),
+        stages: outcome.stages.clone(),
         status: match outcome.verification.verdict {
             Some(Verdict::Pass) => "ok".to_string(),
             _ => "verify_failed".to_string(),
@@ -135,7 +139,7 @@ pub fn save_outcome(cfg: &AppConfig, outcome: &CompileOutcome) -> Result<SaveRes
 }
 
 /// Kompakte menschlesbare Zusammenfassung (Spec §8/§10).
-pub fn format_summary(outcome: &CompileOutcome) -> String {
+pub fn format_summary(outcome: &CompilationResult) -> String {
     let t = &outcome.token_report;
     let mut s = String::new();
     s.push_str(&format!(
@@ -146,7 +150,7 @@ pub fn format_summary(outcome: &CompileOutcome) -> String {
             "Kompilierung (deterministisch, ohne LLM)"
         }
     ));
-    for stage in &outcome.stages_done {
+    for stage in &outcome.stages {
         s.push_str(&format!("  {stage:<12} ✓\n"));
     }
     let est = if t.estimate { " (Schätzung)" } else { "" };
@@ -173,6 +177,14 @@ pub fn format_summary(outcome: &CompileOutcome) -> String {
     for d in &v.details {
         s.push_str(&format!("  ({d})\n"));
     }
+    // v0.2: Qualitätsmetriken sichtbar machen (Semantik + Token-Effizienz).
+    let m = &outcome.metrics;
+    s.push_str(&format!(
+        "\n  Metrics: semantic {:.2} · structural {} · token-efficiency {:.3}\n",
+        m.semantic_fidelity,
+        if m.structural_validity { "ok" } else { "FAIL" },
+        m.token_efficiency
+    ));
     s
 }
 
@@ -181,23 +193,19 @@ fn yesno(b: bool) -> &'static str {
 }
 
 /// JSON-Darstellung des kompletten Ergebnisses (für `--json`).
-pub fn report_json(outcome: &CompileOutcome, saved: Option<&SaveResult>) -> serde_json::Value {
-    serde_json::json!({
-        "request_id": outcome.request_id,
-        "llm_used": outcome.llm_used,
-        "stages": outcome.stages_done,
-        "ir": serde_json::from_str::<serde_json::Value>(&outcome.ir.to_json().unwrap_or_default()).ok(),
-        "long_prompt": outcome.long_prompt,
-        "optimized_prompt": outcome.optimized_prompt,
-        "token_report": outcome.token_report,
-        "verification": outcome.verification,
-        "saved": saved.map(|s| serde_json::json!({
+/// v0.2-Envelope (kanonische Felder + v0.1-Aliase `ir`/`long_prompt`/
+/// `final_output`) plus optionale Speicherpfade.
+pub fn report_json(outcome: &CompilationResult, saved: Option<&SaveResult>) -> serde_json::Value {
+    let mut v = outcome.envelope_json();
+    if let Some(s) = saved {
+        v["saved"] = serde_json::json!({
             "ir": s.ir_path.display().to_string(),
             "long_prompt": s.long_prompt_path.display().to_string(),
             "optimized": s.optimized_path.display().to_string(),
             "history": s.history_path.display().to_string(),
-        })),
-    })
+        });
+    }
+    v
 }
 
 /// Intent-Quelle auflösen: Argument > Datei > stdin (wenn nicht tty).
@@ -228,7 +236,7 @@ pub fn resolve_intent(
 }
 
 /// Kopiert Text in die Zwischenablage (plattformgerecht abstrahiert).
-pub fn copy_optimized(outcome: &CompileOutcome) -> Result<()> {
+pub fn copy_optimized(outcome: &CompilationResult) -> Result<()> {
     pf_core::clipboard::copy_text(&outcome.optimized_prompt)
 }
 
@@ -238,6 +246,22 @@ pub fn read_stdin_if_piped() -> Option<String> {
     if std::io::stdin().is_terminal() {
         return None;
     }
+    read_stdin_fully()
+}
+
+/// Liest stdin vollständig (auch bei tty) — für explizites `compile -`.
+pub fn read_stdin_blocking() -> Result<String> {
+    let t = read_stdin_fully().unwrap_or_default();
+    if t.trim().is_empty() {
+        return Err(err(
+            ErrorKind::InvalidInput,
+            "Kein Intent auf stdin (compile - erwartet Text auf stdin)",
+        ));
+    }
+    Ok(t)
+}
+
+fn read_stdin_fully() -> Option<String> {
     let mut buf = String::new();
     use std::io::Read;
     if std::io::stdin().read_to_string(&mut buf).is_ok() {
@@ -270,6 +294,6 @@ pub fn engine_for_test_mock(cfg: &AppConfig) -> Result<Engine> {
 }
 
 /// Kleine Hilfen für Tests.
-pub fn basic_ir_from_outcome(outcome: &CompileOutcome) -> &PromptIr {
-    &outcome.ir
+pub fn basic_ir_from_outcome(outcome: &CompilationResult) -> &PromptIr {
+    &outcome.prompt_ir
 }

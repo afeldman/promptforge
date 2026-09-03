@@ -1,0 +1,197 @@
+# PromptForge — GitHub Actions CI Workflow (deterministisches Gate)
+#
+# Reproduziert die lokalen Makefile-Gates exakt:
+#   make verify  → fmt, lint, test (compiler-smoke), build
+#
+# Apple Foundation (`apfel`) ist MACOS-SPEZIFISCH und wird NICHT
+# in den normalen Linux-CI integriert (siehe: "WICHTIG: Apfel nicht als normales Linux-CI-Gate behandeln").
+
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  # Python-Version für PyO3 (exakt wie in python/.venv)
+  PYO3_PYTHON: ${{ github.server_os == 'macOS' && 'python/.venv/bin/python' || '.venv/bin/python' }}
+  
+  # Rust Toolchain (aus Cargo.toml: rust-version = "1.98")
+  RUST_VERSION: 1.98
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --- Haupt-CI-Gate (deterministisch, Plattform-unabhängig) ---
+  ci:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-action@v3
+        with:
+          toolchain: 1.98
+      
+      - name: Install uv (Python Package Manager)
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      
+      # Python-Umgebung setuppen (exakt wie `make setup-python`)
+      - name: Setup Python Environment (uv sync)
+        run: |
+          cd python
+          uv sync --frozen
+        env:
+          UV_PROJECT_ENVIRONMENT: .venv
+      
+      - name: Verify Python Version for PyO3
+        run: |
+          echo "=== Verifying Python version used by PyO3 ==="
+          .venv/bin/python --version
+        working-directory: python
+        
+      # Dependencies installieren (exakt wie `make setup-python`)
+      - name: Install Rust Dependencies (cargo)
+        run: cargo fetch
+      
+      # --- Format Check ---
+      - name: Format Check (cargo fmt --check)
+        run: cargo fmt --all -- --check
+      
+      # --- Lint Check ---
+      - name: Lint Check (cargo clippy)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      
+      # --- Rust Tests ---
+      - name: Run Rust Tests
+        run: cargo test --workspace -- --test-threads=1
+        
+      # --- Python Tests ---
+      - name: Run Python Tests (pytest)
+        run: cd python && uv run pytest --tb=short
+        
+      # --- Release Build (PyO3 gegen die venv-Python-Version bauen) ---
+      - name: Release Build (cargo build --release)
+        env:
+          PYO3_PYTHON: .venv/bin/python
+        run: cargo build --release
+      
+      - name: Verify Binary Exists
+        run: |
+          ls -lh target/release/prompt-forge
+      
+      # --- Compiler Smoke Test (deterministisch, ohne LLM) ---
+      - name: Compiler Smoke Test
+        run: |
+          ./tests/compiler-smoke.sh || exit 1
+
+      # --- Artefakte bei CI-Fehlern (Test-Logs, Build-Info) ---
+      # Hinweis: Keine Secrets oder LLM-Prompts in Artefakten
+      
+      - name: Upload Rust Build Artifacts (Release Binary)
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: prompt-forge-release-binary
+          path: target/release/prompt-forge
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload Rust Test Logs
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: rust-test-logs
+          path: |
+            target/debug/*.log
+            **/*.stderr
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Upload Python Test Logs
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: python-test-logs
+          path: |
+            python/.venv/.pytest_cache/
+            **/*.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+  # --- Apple Integration Test (MACOS-SPEZIFISCH, optional) ---
+  apfel-integration:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-action@v3
+        with:
+          toolchain: 1.98
+      
+      - name: Install uv (Python Package Manager)
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      
+      - name: Setup Python Environment (uv sync)
+        run: |
+          cd python
+          uv sync --frozen
+        env:
+          UV_PROJECT_ENVIRONMENT: .venv
+      
+      - name: Verify Python Version for PyO3 (macOS)
+        run: |
+          echo "=== macOS Apple Silicon Detected ==="
+          .venv/bin/python --version
+        working-directory: python
+      
+      # apfel installieren (nur auf macOS)
+      - name: Install apfel (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          brew install apfel || echo "SKIP: apfel bereits installiert"
+      
+      - name: Verify Apfel Installation
+        if: runner.os == 'macOS'
+        run: |
+          apfel --version || echo "SKIP: apfel nicht installiert (Integrationstest wird übersprungen)"
+        
+      # --- Apple Integration Test (separat vom deterministischen CI) ---
+      - name: Apple Foundation Integration Test
+        if: runner.os == 'macOS'
+        env:
+          PYO3_PYTHON: .venv/bin/python
+        run: |
+          # Nur ausführen, wenn apfel installiert ist
+          if command -v apfel >/dev/null 2>&1; then
+            ./tests/providers/apfel/smoke.sh
+          else
+            echo "SKIP: apfel-Integrationstest übersprungen (apfel nicht installiert)"
+            exit 0
+          fi
+        continue-on-error: true
+      
+      # --- Artefakte bei Apfel-Test-Fehlern (optional) ---
+      - name: Upload Apfel Test Logs (macOS only, auf Fehler)
+        if: runner.os == 'macOS' && failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apfel-test-logs
+          path: |
+            **/*.stderr
+            logs/**/*
+          if-no-files-found: ignore
+          retention-days: 3

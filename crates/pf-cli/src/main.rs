@@ -52,9 +52,18 @@ struct CompileArgs {
     /// Prompt in die Zwischenablage kopieren
     #[arg(long)]
     copy: bool,
-    /// Komplettes Ergebnis als JSON auf stdout
+    /// Komplettes Ergebnis als JSON auf stdout (Legacy-Alias für --format json)
     #[arg(long)]
     json: bool,
+    /// Ausgabeformat: text | json | yaml | toon (Default: text)
+    #[arg(long, default_value = "text")]
+    format: String,
+    /// Debug-Trace (echte Prompts/Antworten, redigiert) als Text auf stderr
+    #[arg(long)]
+    debug: bool,
+    /// Debug-Trace als JSON ausgeben (Datei via -o, sonst stdout)
+    #[arg(long, name = "debug-json")]
+    debug_json: bool,
     /// Nur den optimierten Prompt auf stdout (kein Menü)
     #[arg(short = 'p', long = "plain")]
     plain: bool,
@@ -128,45 +137,152 @@ fn run_compile(cfg: &mut AppConfig, args: CompileArgs) -> Result<()> {
         pf_core::log::init_logging(&cfg.log, &secrets, &layout_logs_dir(cfg))?
     };
 
-    let stdin_text = pf_cli::app::read_stdin_if_piped();
-    let intent = pf_cli::app::resolve_intent(args.intent, args.file, stdin_text)?;
+    // Ausgabeformat auflösen; `--json` ist ein Legacy-Alias für `--format json`.
+    let mut format = pf_core::OutputFormat::parse_loose(&args.format)?;
+    if args.json {
+        if !matches!(
+            format,
+            pf_core::OutputFormat::Text | pf_core::OutputFormat::Json
+        ) {
+            return Err(pf_core::error::PfError::new(
+                pf_core::ErrorKind::InvalidInput,
+                format!(
+                    "--json (Legacy) ist nicht mit --format {} kombinierbar (verwende --format json)",
+                    format
+                ),
+            ));
+        }
+        format = pf_core::OutputFormat::Json;
+    }
 
-    // Interaktives Menü nur bei TTY + nicht plain/json + keinem -o.
+    // Intent-Quelle: Argument > Datei > stdin; explizites `-` = stdin (auch tty).
+    // Wichtig: piped stdin nur lesen, wenn NICHT `-` verwendet wird (sonst
+    // wäre der Stream bereits konsumiert).
+    let intent = if args.intent.as_deref() == Some("-") {
+        pf_cli::app::read_stdin_blocking()?
+    } else {
+        let stdin_text = pf_cli::app::read_stdin_if_piped();
+        pf_cli::app::resolve_intent(args.intent, args.file, stdin_text)?
+    };
+
+    // Interaktives Menü nur bei TTY + Text-Format + keinem -o/-plain/-json/
+    // debug-Flags.
     let interactive = std::io::stdout().is_terminal()
         && std::io::stdin().is_terminal()
         && !args.plain
         && !args.json
+        && !args.debug
+        && !args.debug_json
+        && format == pf_core::OutputFormat::Text
         && args.out.is_none();
 
     // Nicht-interaktiv: ein Lauf, dann Ausgabe.
     if !interactive {
         let engine = pf_cli::app::build_engine(cfg)?;
-        let cb = stage_logger();
-        let outcome = engine.compile(&intent, Some(cb))?;
+        // Trace-Collector bei --debug/--debug-json (LlmTrace-Events).
+        let want_trace = args.debug || args.debug_json;
+        let trace_sink: Option<std::rc::Rc<std::cell::RefCell<Vec<StageEvent>>>> = if want_trace {
+            Some(std::rc::Rc::new(std::cell::RefCell::new(Vec::new())))
+        } else {
+            None
+        };
+        let cb: Box<dyn FnMut(StageEvent)> = {
+            let mut base = stage_logger();
+            let sink = trace_sink.clone();
+            Box::new(move |ev| {
+                base(ev.clone());
+                if let Some(s) = &sink
+                    && matches!(ev, StageEvent::LlmTrace { .. } | StageEvent::Note(_))
+                {
+                    s.borrow_mut().push(ev);
+                }
+            })
+        };
+        let compile_result = engine.compile(&intent, Some(cb));
+        let trace_events: Vec<StageEvent> = trace_sink
+            .map(|s| {
+                std::rc::Rc::try_unwrap(s)
+                    .map(|c| c.into_inner())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+
+        // Debug-Trace auch auf Fehler schreiben (partial, ohne Ergebnis).
+        if let Err(e) = &compile_result {
+            if want_trace {
+                let doc = pf_cli::trace::build_partial_trace(&intent, &trace_events);
+                if args.debug_json {
+                    emit_output(
+                        &doc.to_json_pretty()?,
+                        args.out.as_ref(),
+                        &format!("Trace (JSON): {}", e.kind.exit_code()),
+                    )?;
+                }
+                if args.debug {
+                    eprint!("{}", pf_cli::trace::trace_human(&doc));
+                }
+            }
+            return Err(e.clone());
+        }
+        let outcome = compile_result.unwrap();
         let _ = append_meta_history(cfg, &outcome);
 
-        if args.json {
-            let saved = if args.save || args.out.is_some() {
-                pf_cli::app::save_outcome(cfg, &outcome).ok()
-            } else {
-                None
-            };
-            let json = pf_cli::app::report_json(&outcome, saved.as_ref());
-            println!("{}", serde_json::to_string_pretty(&json)?);
+        // --debug-json: Debug-Trace ist die primäre Ausgabe.
+        if args.debug_json {
+            if args.save {
+                let _ = pf_cli::app::save_outcome(cfg, &outcome);
+            }
+            let doc = pf_cli::trace::build_trace(&outcome, &trace_events);
+            emit_output(&doc.to_json_pretty()?, args.out.as_ref(), "Debug-Trace")?;
+            if args.debug {
+                eprint!("{}", pf_cli::trace::trace_human(&doc));
+            }
             return Ok(());
         }
 
-        // Scriptmodus: Statistik auf stderr, Prompt auf stdout/Datei.
-        eprint!("{}", pf_cli::app::format_summary(&outcome));
-        if let Some(out) = &args.out {
-            pf_core::persist::atomic_write(out, outcome.optimized_prompt.as_bytes())?;
-            eprintln!("Geschrieben: {}", out.display());
-        } else {
-            println!("{}", outcome.optimized_prompt);
+        match format {
+            pf_core::OutputFormat::Text => {
+                // Scriptmodus: Statistik auf stderr, Prompt auf stdout/Datei.
+                eprint!("{}", pf_cli::app::format_summary(&outcome));
+                if let Some(out) = &args.out {
+                    pf_core::persist::atomic_write(out, outcome.optimized_prompt.as_bytes())?;
+                    eprintln!("Geschrieben: {}", out.display());
+                } else {
+                    println!("{}", outcome.optimized_prompt);
+                }
+                if args.copy {
+                    pf_cli::app::copy_optimized(&outcome)?;
+                    eprintln!("Prompt in Zwischenablage kopiert.");
+                }
+            }
+            _ => {
+                // Strukturierte Formate (json/yaml/toon): Envelope serialisieren.
+                // Artefakt-Persistenz (wie v0.1 bei --json + --save/-o).
+                let saved = if args.save || args.out.is_some() {
+                    pf_cli::app::save_outcome(cfg, &outcome).ok()
+                } else {
+                    None
+                };
+                let doc = pf_cli::app::report_json(&outcome, saved.as_ref());
+                let serialized = pf_core::serialize::render_structured(format, &doc)?;
+                if let Some(out) = &args.out {
+                    pf_core::persist::atomic_write(out, serialized.as_bytes())?;
+                    eprintln!("Geschrieben: {}", out.display());
+                } else {
+                    // Serializer-Ausgabe endet bereits mit Newline.
+                    print!("{serialized}");
+                }
+                if args.copy {
+                    pf_core::clipboard::copy_text(&serialized)?;
+                    eprintln!("Serialisiertes Ergebnis ({format}) in Zwischenablage kopiert.");
+                }
+            }
         }
-        if args.copy {
-            pf_cli::app::copy_optimized(&outcome)?;
-            eprintln!("Prompt in Zwischenablage kopiert.");
+        // --debug: nach der normalen Ausgabe den menschlesbaren Trace auf
+        // stderr ausgeben (nur wenn nicht bereits --debug-json behandelt).
+        if args.debug {
+            let doc = pf_cli::trace::build_trace(&outcome, &trace_events);
+            eprint!("{}", pf_cli::trace::trace_human(&doc));
         }
         return Ok(());
     }
@@ -209,6 +325,17 @@ fn run_compile(cfg: &mut AppConfig, args: CompileArgs) -> Result<()> {
     }
 }
 
+/// Schreibt Text auf stdout oder in die angegebene Datei.
+fn emit_output(text: &str, out: Option<&PathBuf>, label: &str) -> Result<()> {
+    if let Some(out) = out {
+        pf_core::persist::atomic_write(out, text.as_bytes())?;
+        eprintln!("{label} geschrieben: {}", out.display());
+    } else {
+        print!("{text}");
+    }
+    Ok(())
+}
+
 /// Fortschritts-Callback für Skript-/stderr-Kontexte (LLM-Usage + Notizen).
 fn stage_logger() -> Box<dyn FnMut(StageEvent)> {
     Box::new(|ev| match ev {
@@ -239,6 +366,9 @@ fn stage_logger() -> Box<dyn FnMut(StageEvent)> {
                 usage.completion_tokens
             );
         }
+        // Debug-Trace wird nicht über stage_logger ausgegeben (separater
+        // Collector bei --debug/--debug-json); hier nur abfangen.
+        StageEvent::LlmTrace { .. } => {}
     })
 }
 
@@ -304,16 +434,16 @@ fn layout_logs_dir(cfg: &AppConfig) -> PathBuf {
     cfg.home.join("logs")
 }
 
-fn append_meta_history(cfg: &AppConfig, outcome: &pf_engine::CompileOutcome) -> Result<()> {
+fn append_meta_history(cfg: &AppConfig, outcome: &pf_engine::CompilationResult) -> Result<()> {
     let layout = pf_core::path::HomeLayout::from_root(&cfg.home);
     layout.ensure()?;
     let entry = pf_core::persist::HistoryEntry {
         request_id: outcome.request_id.clone(),
         created_at: pf_core::path::rfc3339_now(),
-        intent: None,
+        intent: Some(outcome.input.clone()),
         model: cfg.llm.model.clone(),
         token_report: serde_json::to_value(&outcome.token_report).ok(),
-        stages: outcome.stages_done.clone(),
+        stages: outcome.stages.clone(),
         status: match outcome.verification.verdict {
             Some(pf_engine::Verdict::Pass) => "ok".to_string(),
             _ => "verify_failed".to_string(),

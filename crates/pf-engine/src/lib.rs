@@ -9,7 +9,8 @@ pub mod pipeline;
 pub mod verify;
 
 pub use optimizer::OptimizerEvent;
-pub use pipeline::{CompileOutcome, Engine, EngineConfig, Stage, StageEvent};
+pub use pf_core::compilation::{CompilationResult, QualityMetrics};
+pub use pipeline::{Engine, EngineConfig, Stage, StageEvent};
 pub use verify::{SemanticReport, Verdict, VerificationReport};
 
 use pf_core::config::VerifyConfig;
@@ -25,6 +26,6 @@ impl From<VerifyConfig> for EngineConfig {
 }
 
 /// Führt eine Kompilierung deterministisch (ohne LLM) aus — für Tests/Tools.
-pub fn compile_deterministic(intent: &str) -> Result<CompileOutcome> {
+pub fn compile_deterministic(intent: &str) -> Result<CompilationResult> {
     Engine::deterministic(EngineConfig::from(VerifyConfig::default())).compile(intent, None)
 }

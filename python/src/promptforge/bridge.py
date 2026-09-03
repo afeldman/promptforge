@@ -84,8 +84,14 @@ def _call(op: str, req: dict, system: str | None, user_text: str) -> dict:
     return resp
 
 
-def _ok(content: str, resp: dict) -> dict:
+def _ok(content: str, resp: dict, system_prompt=None, user_prompt=None) -> dict:
+    """Baut die Antwort; optional mit Echo der tatsächlich verwendeten
+    Prompt-Texte (Debug-Trace: System- und User-Prompt, wie gesendet)."""
     out = {"ok": True, "content": content}
+    if system_prompt is not None:
+        out["system_prompt"] = system_prompt
+    if user_prompt is not None:
+        out["user_prompt"] = user_prompt
     usage = resp.get("usage")
     if usage and (usage.get("prompt_tokens") is not None or usage.get("completion_tokens") is not None):
         out["usage"] = {
@@ -235,22 +241,78 @@ def op_architect(req: dict) -> dict:
             f"(Antwort beginnt: {str(parsed)[:120]!r})",
         )
     ir = _normalize_ir(parsed, str(req.get("request_id") or ""))
-    return _ok(json.dumps(ir, ensure_ascii=False), resp)
+    return _ok(
+        json.dumps(ir, ensure_ascii=False),
+        resp,
+        system_prompt=ARCHITECT_SYSTEM,
+        user_prompt=f"INTENT: {str(intent).strip()}",
+    )
 
 
 def op_optimize(req: dict) -> dict:
     payload = _req_json(req.get("user_prompt") or "")
     long_prompt = payload.get("long_prompt") or ""
     feedback = payload.get("feedback") or []
+    ir = payload.get("ir")
+    if not isinstance(ir, dict):
+        ir = {}
     user_parts = [
         "Optimiere den folgenden Long Prompt. Bewahre alle Constraints und den Output-Contract.",
+        "Die Prompt IR ist die kanonische Quelle. Komprimiere, fasse NICHT zusammen.",
         "",
         "LONG PROMPT:",
         "---",
         str(long_prompt),
         "---",
     ]
+    # Verpflichtende IR-Inhalte explizit anführen (wörtlich erhalten).
+    mandatory = []
+    for key, label in (
+        ("objective", "OBJECTIVES"),
+        ("constraints", "CONSTRAINTS"),
+        ("procedure", "PROCEDURE/INSTRUCTIONS"),
+        ("verification_requirements", "VERIFICATION REQUIREMENTS"),
+        ("context", "CONTEXT"),
+        ("assumptions", "ASSUMPTIONS"),
+    ):
+        values = ir.get(key)
+        if isinstance(values, list):
+            texts = [str(v).strip() for v in values if str(v).strip()]
+            if texts:
+                mandatory.append(f"{label}:")
+                mandatory.extend(f"- {t}" for t in texts)
+    oc = ir.get("output_contract")
+    if isinstance(oc, dict):
+        oc_lines = []
+        if str(oc.get("format") or "").strip():
+            oc_lines.append(f"- Format: {str(oc['format']).strip()}")
+        for item in oc.get("structure") or []:
+            if str(item).strip():
+                oc_lines.append(f"- Struktur: {str(item).strip()}")
+        for item in oc.get("rules") or []:
+            if str(item).strip():
+                oc_lines.append(f"- Regel: {str(item).strip()}")
+        if oc_lines:
+            mandatory.append("OUTPUT CONTRACT:")
+            mandatory.extend(oc_lines)
+    inputs = ir.get("inputs")
+    if isinstance(inputs, list):
+        in_lines = []
+        for item in inputs:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                desc = str(item.get("description") or "").strip()
+                if name or desc:
+                    in_lines.append(f"- {name}: {desc}" if name and desc else f"- {name or desc}")
+        if in_lines:
+            mandatory.append("EINGABEN (INPUTS):")
+            mandatory.extend(in_lines)
+    if mandatory:
+        user_parts.append("")
+        user_parts.append("VERPFLICHTENDE INHALTE — wörtlich erhalten, nicht entfernen, nicht umschreiben:")
+        user_parts.extend(mandatory)
     if feedback:
+        user_parts.append("")
         user_parts.append("Frühere Verifikation meldete folgende fehlende Inhalte (unbedingt erhalten):")
         user_parts.extend(f"- {item}" for item in feedback)
     user_parts.append("IR-Zusammenfassung:")
@@ -264,7 +326,12 @@ def op_optimize(req: dict) -> dict:
         kwargs = _common(req)
         kwargs["provider"] = provider_kind
         resp = llm_provider.chat(messages, **kwargs)
-    return _ok(str(resp.get("content", "")), resp)
+    return _ok(
+        str(resp.get("content", "")),
+        resp,
+        system_prompt=OPTIMIZE_SYSTEM,
+        user_prompt=user_text,
+    )
 
 
 def op_verify(req: dict) -> dict:
@@ -301,7 +368,12 @@ def op_verify(req: dict) -> dict:
     report.setdefault("objective_preserved", False)
     report.setdefault("instructions_preserved", False)
     report.setdefault("comment", "")
-    return _ok(json.dumps(report, ensure_ascii=False), resp)
+    return _ok(
+        json.dumps(report, ensure_ascii=False),
+        resp,
+        system_prompt=VERIFY_SYSTEM,
+        user_prompt=user_text,
+    )
 
 
 def op_chat(req: dict) -> dict:
@@ -315,7 +387,12 @@ def op_chat(req: dict) -> dict:
         kwargs = _common(req)
         kwargs["provider"] = provider_kind
         resp = llm_provider.chat(messages, **kwargs)
-    return _ok(str(resp.get("content", "")), resp)
+    return _ok(
+        str(resp.get("content", "")),
+        resp,
+        system_prompt=None,
+        user_prompt=str(prompt),
+    )
 
 
 # --- Bridge-Einstieg ---

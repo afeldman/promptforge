@@ -53,8 +53,32 @@ pub struct IrMetadata {
     pub request_id: String,
     pub created_at: String,
     pub source_language: Option<String>,
+    /// Freie Tags (v0.1). Eine separate top-level `tags`-Liste ist bewusst
+    /// nicht eingeführt worden (v0.2-Design §5: keine Duplikate).
     pub tags: Vec<String>,
     pub engine_version: String,
+}
+
+/// v0.2 Intent-Analyse (additiv, optional): Ergebnis der Intent-Analyse des
+/// Prompt Generators. Bewusst freie Strings statt fester Taxonomie, damit
+/// keine Liste erzwungen wird (Design §16).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct IntentAnalysis {
+    /// Freie Aufgabentyp-Kategorie (z. B. "audit"), vom LLM erkannt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
+    /// Optionaler Profil-Hinweis (später Templates/Skills; v0.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_hint: Option<String>,
+    /// Sprache des Intents (ISO 639-1 o. ä.), falls erkennbar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Konfidenz der Analyse (0..1), vom LLM geschätzt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// Ambiguitäts-/Verständnisnotizen (optional, kurz).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// Die Prompt-IR (Spec §4: Task, Objective, Context, Inputs, Constraints,
@@ -90,6 +114,10 @@ pub struct PromptIr {
     /// Zielmodell, falls bekannt.
     pub target_model: Option<String>,
     pub metadata: IrMetadata,
+    /// v0.2 (additiv): Ergebnis der Intent-Analyse. Fehlt das Feld in alten
+    /// v0.1-Dokumenten, ist es `None` — Deserialisierung bleibt kompatibel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<IntentAnalysis>,
 }
 
 impl PromptIr {
@@ -211,5 +239,83 @@ mod tests {
         assert_eq!(ir.objective.len(), 1);
         assert_eq!(ir.output_contract.format, "markdown");
         assert!(ir.validate().is_empty());
+    }
+
+    // ---- v0.2: analysis (additiv, optional) ----
+
+    fn v01_json_fixture() -> String {
+        // Exakt das v0.1-Schema: KEINE analysis-Felder.
+        r#"{
+            "schema_version": 1,
+            "task": "Fünf Papers vergleichen",
+            "objective": ["Methoden vergleichen"],
+            "context": [],
+            "inputs": [],
+            "constraints": [],
+            "assumptions": [],
+            "role": null,
+            "procedure": [],
+            "reasoning_strategy": null,
+            "examples": [],
+            "output_contract": { "format": "", "structure": [], "rules": [], "example": null },
+            "verification_requirements": [],
+            "target_model": null,
+            "metadata": {
+                "request_id": "rid-x",
+                "created_at": "2026-01-01T00:00:00Z",
+                "source_language": null,
+                "tags": ["alt"],
+                "engine_version": "0.1.0"
+            }
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn v01_json_without_analysis_still_deserializes() {
+        let ir = PromptIr::from_json(&v01_json_fixture()).unwrap();
+        assert_eq!(ir.schema_version, IR_SCHEMA_VERSION);
+        assert_eq!(ir.task, "Fünf Papers vergleichen");
+        // Neue Felder fehlen → Defaults.
+        assert!(ir.analysis.is_none());
+        assert_eq!(ir.metadata.tags, vec!["alt"]);
+        // Serialisierung erzeugt kein analysis-Feld (skip_serializing_if).
+        let out = serde_json::to_value(&ir).unwrap();
+        assert!(out.get("analysis").is_none());
+    }
+
+    #[test]
+    fn analysis_roundtrip_preserves_fields() {
+        let mut ir = PromptIr::new("rid-a1", "Auditiere das Projekt");
+        ir.analysis = Some(IntentAnalysis {
+            task_type: Some("audit".to_string()),
+            profile_hint: Some("security".to_string()),
+            language: Some("de".to_string()),
+            confidence: Some(0.87),
+            notes: vec!["Ziel unklar: internes oder externes Projekt?".to_string()],
+        });
+        let json = ir.to_json().unwrap();
+        let back = PromptIr::from_json(&json).unwrap();
+        assert_eq!(back, ir);
+        let a = back.analysis.unwrap();
+        assert_eq!(a.task_type.as_deref(), Some("audit"));
+        assert_eq!(a.profile_hint.as_deref(), Some("security"));
+        assert_eq!(a.language.as_deref(), Some("de"));
+        assert!((a.confidence.unwrap() - 0.87).abs() < 1e-9);
+        assert_eq!(a.notes.len(), 1);
+    }
+
+    #[test]
+    fn analysis_is_optional_and_defaults_to_none() {
+        // Normaler neuer Pfad ohne explizite Analyse.
+        let ir = PromptIr::new("rid-a2", "Aufgabe");
+        assert!(ir.analysis.is_none());
+        let json = ir.to_json().unwrap();
+        let back = PromptIr::from_json(&json).unwrap();
+        assert_eq!(back, ir);
+        assert!(back.analysis.is_none());
+        // Defaults der Teil-Struktur sind leer.
+        let a = IntentAnalysis::default();
+        assert!(a.task_type.is_none() && a.notes.is_empty());
     }
 }

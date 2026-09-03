@@ -25,13 +25,21 @@ Service-Status (Version, effektiver Provider, Modell).
 
 Vollständige Pipeline: Intent → IR → Long Prompt → Optimierung → Verifikation.
 
-Request:
+Request (Default, v0.1-kompatibel):
 
 ```json
 { "intent": "Analysiere diese fünf Papers, vergleiche die Methoden …" }
 ```
 
-Response 200:
+Request (v0.2, additiv): `input` als Alias für `intent` sowie optionales
+`format` (text|json|yaml|toon). Mit `format` liefert der Endpoint
+`{format, output, input}` statt des Envelope:
+
+```json
+{ "input": "auditiere das projekt", "format": "yaml" }
+```
+
+Response 200 (Default, ohne `format`):
 
 ```json
 {
@@ -58,6 +66,11 @@ Response 200:
 
 Bei nicht bestandener Verifikation nach `max_attempts`: HTTP 422 mit
 `kind: verification`.
+
+Hinweis: Der CLI-Debug-Trace (`prompt-forge compile … --debug` bzw.
+`--debug-json -o debug.json`, Details README) ist eine CLI-Funktion und
+betrifft die API-Antworten nicht; `/v1/compile` liefert weiterhin den
+Envelope bzw. bei `format` das `{format, output, input}`-Dokument.
 
 ## POST /v1/optimize
 

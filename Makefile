@@ -26,13 +26,19 @@ help: ## Zeigt diese Hilfe
 	@printf '  make setup-python  Python environment via uv (alle Plattformen)\n'
 	@printf '  make setup-macos   macOS checks: Homebrew, Apple Silicon, apfel\n'
 	@printf '  make build       Build release binary (target/release/prompt-forge)\n'
-	@printf '  make test        Run all tests (Rust + Python)\n'
+	@printf '  make test        Run all tests (Rust + Python + deterministischer Compiler-Smoke)\n'
 	@printf '  make test-rust   Run cargo test --workspace\n'
 	@printf '  make test-python Run Python tests via uv (pytest)\n'
+	@printf '  make test-compiler  Deterministic compiler smoke (CompilationResult, --no-llm)\n'
 	@printf '  make lint        Run clippy (warnings = Fehler)\n'
 	@printf '  make fmt         Check formatting (cargo fmt)\n'
-	@printf '  make test-apfel  Run macOS/apfel integration test (real LLM)\n'
-	@printf '  make verify      fmt + lint + test + build (+ test-apfel auf macOS/arm64)\n'
+	@printf '  make test-apfel  Run macOS/apfel integration test (real LLM, stochastisch)\n'
+	@printf '  make apfel-start  Start local apfel server in background (macOS/arm64; idempotent)\n'
+	@printf '  make apfel-stop   Stop the apfel server started by apfel-start\n'
+	@printf '  make apfel-status Show apfel install/running/health/model status\n'
+	@printf '  make apfel        Alias for apfel-status\n'
+	@printf '  make verify      fmt + lint + test + build (deterministisch; apfel NICHT enthalten)\n'
+	@printf '  make verify-all  verify + test-apfel (opt-in, echter LLM auf macOS/arm64)\n'
 	@printf '  make clean       Remove build artifacts (cargo clean)\n'
 
 # --- Setup ---
@@ -79,7 +85,7 @@ build: ## Erzeugt Release-Binary target/release/prompt-forge
 
 # --- Tests ---
 
-test: test-rust test-python ## Führt Rust- und Python-Tests aus
+test: test-rust test-python test-compiler ## Führt alle deterministischen Tests aus (Rust + Python + Compiler-Smoke)
 	@printf '==> Alle Tests erfolgreich\n'
 
 test-rust: ## cargo test --workspace (hermetisch: LLM_*-Env scrubben + seriell wegen Env-Tests)
@@ -89,6 +95,10 @@ test-rust: ## cargo test --workspace (hermetisch: LLM_*-Env scrubben + seriell w
 test-python: ## Python-Tests via uv (pytest)
 	@printf '==> uv run pytest (python/)\n'
 	@cd python && uv run pytest
+
+test-compiler: build ## Deterministischer Compiler-Smoke gegen das Release-Binary (CompilationResult, --no-llm)
+	@printf '==> tests/compiler-smoke.sh\n'
+	@./tests/compiler-smoke.sh
 
 # --- Format / Lint ---
 
@@ -102,17 +112,54 @@ lint: ## Clippy (Warnings = Fehler)
 
 # --- apfel-Integrationstest (echter LLM-Pfad, macOS/Apple Silicon) ---
 
+# Endpoint-Konvention (APFEL_ENDPOINT wie in tests/providers/apfel/smoke.sh).
+APFEL_ENDPOINT ?= http://127.0.0.1:11434/v1
+
+apfel: apfel-status ## Alias für apfel-status
+
+apfel-start: ## Startet apfel --serve im Hintergrund (macOS/arm64; idempotent, wartet auf /health)
+	@case "$$(uname -s)$$(uname -m)" in \
+	    Darwinarm64) \
+	        APFEL_ENDPOINT="$(APFEL_ENDPOINT)" scripts/apfel.sh start ;; \
+	    *) printf 'SKIP: apfel lifecycle is macOS/Apple Silicon only\n' ;; \
+	esac
+
+apfel-stop: ## Beendet den von apfel-start verwalteten apfel-Server (kein Fehler, wenn schon beendet)
+	@case "$$(uname -s)$$(uname -m)" in \
+	    Darwinarm64) \
+	        APFEL_ENDPOINT="$(APFEL_ENDPOINT)" scripts/apfel.sh stop ;; \
+	    *) printf 'SKIP: apfel lifecycle is macOS/Apple Silicon only\n' ;; \
+	esac
+
+apfel-status: ## Zeigt apfel-Installation, Serverstatus, Health, Endpoint, Modell
+	@case "$$(uname -s)$$(uname -m)" in \
+	    Darwinarm64) \
+	        APFEL_ENDPOINT="$(APFEL_ENDPOINT)" scripts/apfel.sh status ;; \
+	    *) printf 'apfel lifecycle is macOS/Apple Silicon only\n' ;; \
+	esac
+
 test-apfel: build ## Führt tests/providers/apfel/smoke.sh aus (Default-Modus; eigenständiger Server-Lifecycle)
 	@printf '==> tests/providers/apfel/smoke.sh\n'
 	@./tests/providers/apfel/smoke.sh
 
 # --- Verifikation / Clean ---
+#
+# Design-Entscheidung (v0.2 Phase 1): `make verify` ist DETERMINISTISCH und
+# hängt bewusst NICHT von der stochastischen Qualität des Apple Foundation
+# Model ab (der apfel-E2E kann trotz grüner Gates real fehlschlagen, wenn das
+# Modell degeneriert — legitimes Ergebnis laut tests/providers/apfel/README).
+# Der echte LLM-Pfad bleibt als opt-in `make verify-all`/`make test-apfel`
+# verfügbar. Begründung: reproduzierbares Gate für CI/Entwicklung.
 
-verify: ## Kompletter Qualitätscheck: fmt, lint, test, build; auf macOS/arm64 + apfel zusätzlich test-apfel
+verify: ## Deterministischer Komplettcheck: fmt, lint, test (inkl. Compiler-Smoke), build
 	@$(MAKE) fmt
 	@$(MAKE) lint
 	@$(MAKE) test
 	@$(MAKE) build
+	@printf '==> verify OK (deterministisch; apfel-Integration separat via make verify-all / make test-apfel)\n'
+
+verify-all: ## verify + echter apfel-Integrationstest (macOS/arm64; stochastisch)
+	@$(MAKE) verify
 	@case "$$(uname -s)$$(uname -m)" in \
 	    Darwinarm64) \
 	        if command -v apfel >/dev/null 2>&1; then \
@@ -128,4 +175,4 @@ clean: ## Entfernt Build-Artefakte (nur Build-Artefakte; niemals ~/.prompt-forge
 	@cargo clean
 	@printf 'Clean: target/ entfernt. Python-Env (.venv) bleibt erhalten.\n'
 
-.PHONY: help setup setup-python setup-macos build test test-rust test-python fmt lint test-apfel verify clean
+.PHONY: help setup setup-python setup-macos build test test-rust test-python test-compiler fmt lint apfel apfel-start apfel-stop apfel-status test-apfel verify verify-all clean

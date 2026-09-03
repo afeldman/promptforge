@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use pf_core::bridge::{LlmBridge, LlmOperation, LlmRequest, LlmResponse, Usage};
+use pf_core::compilation::{CompilationResult, QualityMetrics};
 use pf_core::config::{LlmConfig, ProviderKind, VerifyConfig};
 use pf_core::error::{ErrorKind, Result, err};
 use pf_core::ir::PromptIr;
@@ -49,8 +50,25 @@ impl Stage {
 #[derive(Debug, Clone)]
 pub enum StageEvent {
     StageStarted(Stage),
-    StageFinished { stage: Stage, ok: bool },
-    LlmUsage { stage: Stage, usage: Usage },
+    StageFinished {
+        stage: Stage,
+        ok: bool,
+    },
+    LlmUsage {
+        stage: Stage,
+        usage: Usage,
+    },
+    /// Vollständiger LLM-Call für Debug-Trace (`--debug`/`--debug-json`).
+    /// Trägt die tatsächlich gesendeten Prompts (Echo der Python-Schicht)
+    /// und die rohe Antwort — redigiert (keine Secrets).
+    LlmTrace {
+        stage: Stage,
+        attempt: u32,
+        system_prompt: Option<String>,
+        user_prompt: String,
+        raw_response: String,
+        duration_ms: Option<u64>,
+    },
     Note(String),
 }
 
@@ -66,23 +84,6 @@ impl EngineConfig {
     pub fn llm_available(&self, provider: ProviderKind) -> bool {
         matches!(provider, ProviderKind::AnyLlm | ProviderKind::Mock) && self.llm.is_configured()
     }
-}
-
-/// Vollständiges Kompilier-Ergebnis.
-#[derive(Debug, Clone)]
-pub struct CompileOutcome {
-    pub request_id: String,
-    pub ir: PromptIr,
-    pub long_prompt: String,
-    pub optimized_prompt: String,
-    pub token_report: TokenReport,
-    pub verification: VerificationReport,
-    pub llm_used: bool,
-    pub stages_done: Vec<String>,
-    /// LLM-Tokenverbrauch je Stufe (falls vom Provider geliefert).
-    pub usage: Vec<(String, Usage)>,
-    /// Nachvollziehbare Optimizer-Aktionen.
-    pub optimizer_events: Vec<OptimizerEvent>,
 }
 
 /// Die PromptForge-Engine: eine Instanz pro Konfiguration.
@@ -169,10 +170,11 @@ impl Engine {
         op: LlmOperation,
         payload: serde_json::Value,
         request_id: &str,
+        attempt: u32,
         cb: &mut Option<Box<dyn FnMut(StageEvent)>>,
     ) -> Result<LlmResponse> {
         let req = self.bridge_request(op, payload, request_id);
-        tracing::info!(operation = op.as_str(), request_id, model = ?req.model, "llm call");
+        tracing::info!(operation = op.as_str(), request_id, model = ?req.model, attempt, "llm call");
         let resp = self.bridge.complete(&req)?;
         if let Some(usage) = resp.usage {
             Self::emit(
@@ -183,16 +185,34 @@ impl Engine {
                 },
             );
         }
+        // Debug-Trace-Event: echte Prompts (Echo der Python-Schicht) + rohe
+        // Antwort, redigiert (Secret-Werte, Bearer-/sk-/key=-Muster).
+        let secrets: Vec<String> = self.cfg.llm.key.clone().into_iter().collect();
+        let san = |s: &str| pf_core::redact::sanitize_line(s, &secrets);
+        Self::emit(
+            cb,
+            StageEvent::LlmTrace {
+                stage: stage_of(op),
+                attempt,
+                system_prompt: resp.system_prompt.as_deref().map(san),
+                user_prompt: san(resp.user_prompt.as_deref().unwrap_or(&req.user_prompt)),
+                raw_response: san(&resp.content),
+                duration_ms: resp.duration_ms,
+            },
+        );
         Ok(resp)
     }
 
     /// Kompiliert einen Intent (natürliche Sprache) bis zum optimierten Prompt.
     /// `cb` erhält Fortschritts-Events (z. B. für TUI/CLI).
+    ///
+    /// Ergebnis ist ein formatneutrales `CompilationResult` (v0.2) — die
+    /// einzige Ergebnisstruktur; keine zweite Pipeline.
     pub fn compile(
         &self,
         intent: &str,
         mut cb: Option<Box<dyn FnMut(StageEvent)>>,
-    ) -> Result<CompileOutcome> {
+    ) -> Result<CompilationResult> {
         let request_id = pf_core::path::request_id();
         let intent = intent.trim();
         if intent.is_empty() {
@@ -203,7 +223,7 @@ impl Engine {
         Self::emit(&mut cb, StageEvent::StageStarted(Stage::Architect));
         let ir = if self.llm_on() {
             let payload = serde_json::json!({ "intent": intent });
-            let resp = self.call(LlmOperation::Architect, payload, &request_id, &mut cb)?;
+            let resp = self.call(LlmOperation::Architect, payload, &request_id, 1, &mut cb)?;
             parse_ir(&resp, "Architect")?
         } else {
             PromptIr::from_intent_basic(intent, &request_id)
@@ -228,7 +248,7 @@ impl Engine {
         );
 
         // ---- Stage 3/4: Optimize + Verify (mit Re-Optimize-Loop) ----
-        let (optimized, verification, optimizer_events) =
+        let (optimized, verification, _optimizer_events) =
             self.optimize_and_verify(&ir, &long_prompt, &request_id, &mut cb)?;
 
         match verification.verdict {
@@ -243,7 +263,6 @@ impl Engine {
                     &long_prompt,
                     &optimized,
                     verification,
-                    optimizer_events,
                     request_id,
                 ))
             }
@@ -291,7 +310,13 @@ impl Engine {
                     "long_prompt": long_prompt,
                     "feedback": last_feedback,
                 });
-                let resp = self.call(LlmOperation::Optimize, payload, request_id, cb)?;
+                let resp = self.call(
+                    LlmOperation::Optimize,
+                    payload,
+                    request_id,
+                    attempt as u32 + 1,
+                    cb,
+                )?;
                 extract_prompt(&resp)?
             } else {
                 long_prompt.to_string()
@@ -299,8 +324,18 @@ impl Engine {
             // Deterministische Hygiene-Passes (auch nach LLM-Pass).
             let (hygiene, evs) = deterministic_pass_chain(&optimized);
             optimizer_events.extend(evs);
-            // Guard-Pass: Pflicht-Atome (Constraints/Contract/Req.) erhalten.
+            // Guard-Pass: Pflicht-Atome (Constraints/Contract/Req. u. a.) erhalten.
             let (guarded, ev) = reinsert_missing_atoms(&hygiene, &mandatory_atoms(&atoms));
+            if let crate::optimizer::PassAction::ReinsertedAtoms(n) = ev.action
+                && n > 0
+            {
+                Self::emit(
+                    cb,
+                    StageEvent::Note(format!(
+                        "Guard-Pass hat {n} verlorene Pflicht-Atome wiederhergestellt (Re-Optimize-Ergebnis war unvollständig)"
+                    )),
+                );
+            }
             optimizer_events.push(ev);
             optimized = guarded;
 
@@ -313,7 +348,13 @@ impl Engine {
                     "long_prompt": long_prompt,
                     "optimized_prompt": optimized,
                 });
-                let resp = self.call(LlmOperation::Verify, payload, request_id, cb)?;
+                let resp = self.call(
+                    LlmOperation::Verify,
+                    payload,
+                    request_id,
+                    attempt as u32 + 1,
+                    cb,
+                )?;
                 let semantic = parse_semantic_report_json(&resp.parse_content_json()?)?;
                 merge_semantic(structural, semantic, self.cfg.verify.threshold)
             } else {
@@ -378,7 +419,7 @@ impl Engine {
                 "long_prompt": long_prompt,
                 "optimized_prompt": optimized,
             });
-            let resp = self.call(LlmOperation::Verify, payload, request_id, cb)?;
+            let resp = self.call(LlmOperation::Verify, payload, request_id, 1, cb)?;
             let semantic = parse_semantic_report_json(&resp.parse_content_json()?)?;
             merge_semantic(structural, semantic, self.cfg.verify.threshold)
         } else {
@@ -402,31 +443,31 @@ impl Engine {
         long_prompt: &str,
         optimized: &str,
         verification: VerificationReport,
-        optimizer_events: Vec<OptimizerEvent>,
         request_id: String,
-    ) -> CompileOutcome {
+    ) -> CompilationResult {
         let tokenizer = Arc::clone(&self.tokenizer);
         let mut token_report = TokenReport::new();
         token_report.estimate = tokenizer.is_estimate();
         token_report.set_original(tokenizer.count(intent));
         token_report.set_generated(tokenizer.count(long_prompt));
         token_report.set_optimized(tokenizer.count(optimized));
-        CompileOutcome {
+        let metrics = QualityMetrics::compute(&verification, &token_report);
+        CompilationResult {
+            input: intent.to_string(),
             request_id,
-            ir,
-            long_prompt: long_prompt.to_string(),
-            optimized_prompt: optimized.to_string(),
-            token_report,
-            verification,
             llm_used: self.llm_on(),
-            stages_done: vec![
+            stages: vec![
                 Stage::Architect.as_str().to_string(),
                 Stage::Expand.as_str().to_string(),
                 Stage::Optimize.as_str().to_string(),
                 Stage::Verify.as_str().to_string(),
             ],
-            usage: Vec::new(),
-            optimizer_events,
+            prompt_ir: ir,
+            expanded_prompt: long_prompt.to_string(),
+            optimized_prompt: optimized.to_string(),
+            token_report,
+            verification,
+            metrics,
         }
     }
 }
@@ -494,7 +535,7 @@ pub fn execute_prompt(
     }
     let request_id = pf_core::path::request_id();
     let payload = serde_json::json!({ "prompt": prompt });
-    engine.call(LlmOperation::Chat, payload, &request_id, &mut cb)
+    engine.call(LlmOperation::Chat, payload, &request_id, 1, &mut cb)
 }
 
 #[cfg(test)]
@@ -521,13 +562,38 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(outcome.long_prompt.contains("## Aufgabe"));
+        // v0.2: CompilationResult mit kanonischen Feldern + Metriken.
+        assert_eq!(
+            outcome.input,
+            "Analysiere diese fünf Papers und vergleiche die Methoden"
+        );
+        assert!(outcome.expanded_prompt.contains("## Aufgabe"));
         assert!(!outcome.optimized_prompt.is_empty());
-        assert!(!outcome.ir.task.is_empty());
+        assert!(!outcome.prompt_ir.task.is_empty());
         assert_eq!(outcome.verification.verdict, Some(Verdict::Pass));
         assert!(!outcome.llm_used);
         assert!(outcome.token_report.generated > 0);
-        assert_eq!(outcome.stages_done.len(), 4);
+        assert_eq!(outcome.stages.len(), 4);
+        // Qualitätsmetriken deterministisch vorhanden.
+        assert!(outcome.metrics.structural_validity);
+        assert!(
+            (outcome.metrics.semantic_fidelity - outcome.verification.semantic_preservation).abs()
+                < 1e-9
+        );
+        assert!(outcome.metrics.token_efficiency >= 0.0); // ohne LLM: 1:1-Kopie
+    }
+
+    #[test]
+    fn deterministic_compile_input_is_trimmed_and_analysis_defaults() {
+        let engine = Engine::deterministic(cfg());
+        let outcome = engine.compile("  Auditiere das Projekt  ", None).unwrap();
+        assert_eq!(outcome.input, "Auditiere das Projekt");
+        assert!(outcome.prompt_ir.analysis.is_none());
+        assert!(outcome.prompt_ir.metadata.tags.is_empty());
+        // CompilationResult ist JSON-serialisierbar (formatneutral).
+        let json = serde_json::to_string(&outcome).unwrap();
+        let back: pf_core::CompilationResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, outcome);
     }
 
     #[test]
@@ -548,7 +614,11 @@ mod tests {
             .unwrap();
         assert!(outcome.llm_used);
         assert_eq!(outcome.verification.verdict, Some(Verdict::Pass));
-        assert!(outcome.ir.role.is_some());
+        assert!(outcome.prompt_ir.role.is_some());
+        // CompilationResult vorhanden (v0.2) — echter Pipeline-Lauf.
+        assert!(!outcome.input.is_empty());
+        assert_eq!(outcome.stages.len(), 4);
+        assert!(outcome.metrics.semantic_fidelity >= 0.0);
         // Alle Stadien wurden als Started/Finished gemeldet.
         let starts = events
             .borrow()

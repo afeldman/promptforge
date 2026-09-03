@@ -35,6 +35,7 @@ unnötige Komplexität.
 | D-10 | Secrets niemals loggen: Redaction-Schicht auf beiden Seiten; Prompt-Inhalte standardmäßig nicht in Logs (opt-in `prompt_log`) | Spec §16/§17 |
 | D-11 | Sync-Core-Engine; CLI/TUI/Service wrappen Blocking-Aufrufe in Threads/Tasks | einfache, deterministische Pipeline; parallele LLM-Aufrufe später möglich |
 | D-12 | Fehler als typisierte `PfError`-Familie (thiserror) mit stabilem `kind`-Feld für Exit-Codes/API | Spec §19 |
+| D-13 | **Formatneutrales `CompilationResult`** (pf-core) als einziges Engine-Ergebnis; **Serializer-Layer** (pf-core, Rust): `OutputFormat` (text/json/yaml/toon) + `PromptSerializer`-Trait; text = ausführbarer Prompt, json/yaml/toon = Envelope desselben Datenmodells; `--format`/`--json`-Alias | v0.2 Design §4/§5; Determinismus, keine zweite Pipeline, Serializer ohne LLM |
 
 ## 2. Repository-Layout
 
@@ -198,9 +199,9 @@ Reihenfolge: Builtin-Defaults < `$PF_HOME/config/config.toml` < Environment.
 
 `PfError` mit `kind`: Configuration, Provider, Authentication, Model,
 Timeout, Tokenization, Optimization, Verification, Persistence, Bridge,
-Json, Io, InvalidInput. JSON-/CLI-kompatibel (`kind`, `message`, optional
-`retryable`). Exit-Codes CLI: 0 ok, 1 generisch, 2 Usage, 3 Config, 4 LLM,
-5 Pipeline/Verify, 6 Persistence.
+Serialization, Json, Io, InvalidInput. JSON-/CLI-kompatibel (`kind`,
+`message`, optional `retryable`). Exit-Codes CLI: 0 ok, 1 generisch, 2 Usage,
+3 Config, 4 LLM, 5 Pipeline/Verify, 6 Persistence, 7 Infra/Bridge.
 
 ## 10. Persistenz & History (pf-core)
 
@@ -224,18 +225,46 @@ Json, Io, InvalidInput. JSON-/CLI-kompatibel (`kind`, `message`, optional
 ## 12. CLI (pf-cli, Binary `prompt-forge`)
 
 ```
-prompt-forge [compile] [TEXT|DATEI]   # stdin, falls nicht tty
+prompt-forge [compile] [TEXT|DATEI]   # stdin, falls nicht tty (auch `-`)
 prompt-forge init                     # Verzeichnisse + Default-Config anlegen
 prompt-forge serve                    # HTTP-Service (pf-service)
 prompt-forge tui                      # TUI (pf-tui)
-prompt-forge compile --json …         # maschinenlesbar
+prompt-forge compile --json …         # maschinenlesbar (Legacy-Alias)
+prompt-forge compile --format yaml …  # Envelope als YAML
 ```
 
-Flags: `-o/--out`, `--copy` (in Clipboard), `-i/--interactive` (Menü:
-Copy/Save/Show/Recompile), `--no-llm`, `--model/--endpoint`-Override,
-`--json`, `-v` (verbose), `--config` (Config-Pfad). TTY ohne `--json` →
-Zusammenfassung + interaktives Menü; Nicht-TTY → Prompt auf stdout
+Flags: `-o/--out`, `--copy` (kopiert exakt die erzeugte Serializer-Ausgabe),
+`-i/--interactive` (Menü: Copy/Save/Show/Recompile), `--no-llm`,
+`--model/--endpoint`-Override, `--format text|json|yaml|toon`, `--json`
+(= `--format json`), `--debug` (menschlesbarer Trace auf stderr),
+`--debug-json` (Trace als JSON, Datei via `-o`), `-v` (verbose),
+`--config` (Config-Pfad). TTY ohne `--json`/strukturiertes Format →
+Zusammenfassung + interaktives Menü; Nicht-TTY → Prompt/Envelope auf stdout
 (scriptbar), Statistik auf stderr. Exit-Codes nach §9.
+
+**Debug-Trace (`--debug`/`--debug-json`, v0.2)**: Die Engine emittiert pro
+LLM-Call ein `StageEvent::LlmTrace` (Stufe, Attempt, System-/User-Prompt als
+Echo der Python-Schicht, rohe Antwort — redigiert). CLI baut daraus ein
+serialisierbares Dokument `{input, llm_used, stages[]}`; Stufen ohne LLM
+sind `llm: false` mit Hinweis, kein künstliches `raw_response`. Bei
+Fehlern wird ein partieller Trace geschrieben (kein Verlust der echten
+Requests im Fehlerfall).
+
+**Ausgabe-Serialisierung (v0.2, pf-core `serialize`)**:
+
+```text
+CompilationResult (formatneutral, kennt keine Formate)
+   ├── TextSerializer  → optimized_prompt (ausführbarer Prompt)
+   ├── JsonSerializer  → Envelope als JSON (pretty, deterministisch)
+   ├── YamlSerializer  → Envelope als YAML (serde_norway 0.9)
+   └── ToonSerializer  → Envelope als TOON (toon-format 0.5, Spec v3.0)
+```
+
+json/yaml/toon repräsentieren dasselbe Datenmodell (`CompilationResult`-
+Envelope inkl. v0.1-Aliasen `ir`/`long_prompt`/`final_output` für
+Abwärtskompatibilität); Serialisierung ist deterministisch, rein lokal und
+löst keinen LLM-Aufruf aus. `-o` bestimmt das Format über `--format`, nicht
+über die Dateiendung.
 
 Clipboard: Trait `Clipboard { set_text }`; Impls: `ArboardClipboard`
 (Standard) und Kommando-Fallback (pbcopy/wl-copy/xclip/Set-Clipboard).
@@ -251,7 +280,8 @@ Recompile, Quit. Pipeline läuft im Worker-Thread, UI pollt Events.
 
 `prompt-forge serve` → axum auf `127.0.0.1:8770` (konfigurierbar).
 Endpunkte (Details: docs/api.md):
-- `POST /v1/compile`   — Intent → kompilierter Prompt (+ Report)
+- `POST /v1/compile`   — Intent → kompilierter Prompt (+ Report); optional
+  `format` (text|json|yaml|toon) → `{format, output, input}` (v0.2, additiv)
 - `POST /v1/optimize`  — Long Prompt / IR → optimierter Prompt
 - `POST /v1/verify`    — Original vs. optimiert → VerificationReport
 - `POST /v1/execute`   — fertigen Prompt gegen Ziel-LLM ausführen

@@ -1,67 +1,17 @@
 //! Verifikation (Spec §7): strukturelle Checks in Rust (deterministisch) +
 //! optional LLM-Semantik-Check (Python). Ergebnis strukturiert.
+//!
+//! Die Datentypen (CheckResult, Verdict, SemanticReport, VerificationReport)
+//! leben in pf-core (damit das formatneutrale `CompilationResult` sie ohne
+//! pf-engine-Abhängigkeit referenzieren kann) und werden hier re-exportiert,
+//! damit bestehende Importe (`pf_engine::verify::…`) unverändert bleiben.
 
-use serde::{Deserialize, Serialize};
+pub use pf_core::verify::{CheckResult, SemanticReport, Verdict, VerificationReport};
 
 use pf_core::Result;
 use pf_core::ir::PromptIr;
 
 use crate::optimizer::token_set;
-
-/// Ein einzelner Semantik-Atom-Check (Atom = zu erhaltender Textbaustein).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CheckResult {
-    pub category: String,
-    pub atom: String,
-    pub ok: bool,
-    /// Anteil der Atom-Tokens, die im Zieltext enthalten sind (0..1).
-    pub ratio: f64,
-}
-
-/// Verdict der strukturellen Verifikation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Verdict {
-    Pass,
-    Fail,
-}
-
-impl Verdict {
-    pub fn is_pass(self) -> bool {
-        self == Verdict::Pass
-    }
-}
-
-/// LLM-Semantik-Bericht (Python `verify`-Operation).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SemanticReport {
-    pub semantic_preservation: f64,
-    pub constraints_preserved: bool,
-    pub output_contract_preserved: bool,
-    pub objective_preserved: bool,
-    pub instructions_preserved: bool,
-    #[serde(default)]
-    pub comment: String,
-}
-
-/// Vollständiger Verifikationsbericht.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct VerificationReport {
-    /// Gesamt-Semantik-Erhalt (0..1).
-    pub semantic_preservation: f64,
-    pub constraints_preserved: bool,
-    pub output_contract_preserved: bool,
-    pub objective_preserved: bool,
-    pub instructions_preserved: bool,
-    pub verification_requirements_preserved: bool,
-    pub verdict: Option<Verdict>,
-    #[serde(default)]
-    pub checks: Vec<CheckResult>,
-    /// Anzahl Verifikations-/Retry-Läufe.
-    pub attempts: u32,
-    #[serde(default)]
-    pub details: Vec<String>,
-}
 
 /// Mindest-Ratio pro Atom, ab der es als erhalten gilt.
 const ATOM_OK_RATIO: f64 = 0.75;
@@ -74,6 +24,9 @@ pub struct SemanticAtoms {
     pub contract: Vec<String>,
     pub instructions: Vec<String>,
     pub requirements: Vec<String>,
+    pub context: Vec<String>,
+    pub inputs: Vec<String>,
+    pub assumptions: Vec<String>,
 }
 
 impl SemanticAtoms {
@@ -111,6 +64,36 @@ impl SemanticAtoms {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            // v0.2-Optimizer-Regeln: auch Kontext/Eingaben/Annahmen sind
+            // verpflichtende Atom-Inhalte (dürfen nicht verloren gehen).
+            context: ir
+                .context
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            inputs: ir
+                .inputs
+                .iter()
+                .map(|i| {
+                    let name = i.name.trim();
+                    let desc = i.description.trim();
+                    if name.is_empty() {
+                        desc.to_string()
+                    } else if desc.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{name}: {desc}")
+                    }
+                })
+                .filter(|s| !s.is_empty())
+                .collect(),
+            assumptions: ir
+                .assumptions
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
         }
     }
 
@@ -125,6 +108,9 @@ impl SemanticAtoms {
                 .iter()
                 .map(|s| ("verification_requirement", s)),
         );
+        out.extend(self.context.iter().map(|s| ("context", s)));
+        out.extend(self.inputs.iter().map(|s| ("input", s)));
+        out.extend(self.assumptions.iter().map(|s| ("assumption", s)));
         out
     }
 }
@@ -259,9 +245,9 @@ pub fn atoms_payload(atoms: &SemanticAtoms) -> serde_json::Value {
 }
 
 /// Pflicht-Atome für den Reinsert-Guard-Pass: Objective, Constraints,
-/// Output-Contract und Instructions werden strukturell erhalten — der
-/// Guard verhindert, dass wichtige Informationen durch die Optimierung
-/// verloren gehen (Spec §6/§7).
+/// Output-Contract, Instructions, Verification Requirements — plus Kontext,
+/// Eingaben und Annahmen (v0.2: Optimizer darf keine IR-relevante Information
+/// entfernen; Guard stellt verlorene Atome wieder her).
 pub fn mandatory_atoms(atoms: &SemanticAtoms) -> Vec<String> {
     let mut out = Vec::new();
     out.extend(atoms.objective.iter().cloned());
@@ -269,6 +255,9 @@ pub fn mandatory_atoms(atoms: &SemanticAtoms) -> Vec<String> {
     out.extend(atoms.contract.iter().cloned());
     out.extend(atoms.instructions.iter().cloned());
     out.extend(atoms.requirements.iter().cloned());
+    out.extend(atoms.context.iter().cloned());
+    out.extend(atoms.inputs.iter().cloned());
+    out.extend(atoms.assumptions.iter().cloned());
     out
 }
 
@@ -349,5 +338,59 @@ mod tests {
         let atoms = SemanticAtoms::from_ir(&ir);
         let v = atoms_payload(&atoms);
         assert!(v["constraints"].as_array().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn summary_only_is_not_a_pass_and_guard_restores_atoms() {
+        // v0.2: Ein Optimierer, der die IR auf eine Zusammenfassung reduziert
+        // („Identifizieren von Risiken, …“), darf NICHT bestehen; der Guard
+        // stellt verlorene Pflicht-Atome wieder her, erst dann ist PASS ok.
+        let mut ir = ir_fixture();
+        ir.objective = vec!["Alle Architekturrisiken identifizieren".to_string()];
+        ir.context = vec!["Repository: PromptForge (Rust/Python)".to_string()];
+        ir.inputs = vec![pf_core::ir::InputSpec {
+            name: "Projektpfad".to_string(),
+            description: "Lokaler Pfad zum Repository".to_string(),
+        }];
+        ir.assumptions = vec!["Lokale Entwicklung auf macOS".to_string()];
+        let atoms = SemanticAtoms::from_ir(&ir);
+
+        // Reine Zusammenfassung („kurz, aber semantisch schlecht“):
+        let summary = "Identifizieren von Risiken, Evaluieren der Projektqualität und Erstellen eines Berichts.\n";
+        let bare = verify_structural(&ir, summary, &atoms, 0.85);
+        assert_eq!(
+            bare.verdict,
+            Some(Verdict::Fail),
+            "Zusammenfassung darf keinen PASS erhalten"
+        );
+        assert!(!bare.objective_preserved);
+
+        // Guard stellt alle Pflicht-Atome wieder her:
+        let (guarded, ev) = crate::optimizer::reinsert_missing_atoms(
+            summary,
+            &crate::verify::mandatory_atoms(&atoms),
+        );
+        assert!(
+            matches!(
+                ev.action,
+                crate::optimizer::PassAction::ReinsertedAtoms(n) if n >= 5
+            ),
+            "Guard soll mehrere Kategorien wiederherstellen"
+        );
+        for atom in crate::verify::mandatory_atoms(&atoms) {
+            assert!(
+                guarded.contains(atom.trim()),
+                "Guard hat Atom nicht wiederhergestellt: {atom}"
+            );
+        }
+        let repaired = verify_structural(&ir, &guarded, &atoms, 0.85);
+        assert_eq!(
+            repaired.verdict,
+            Some(Verdict::Pass),
+            "Guard-reparierter Prompt darf PASS erhalten"
+        );
+        // Ein niedrigerer Token-Count allein ist kein Erfolg: semantic bleibt
+        // an Atome gebunden.
+        assert!(guarded.chars().count() < summary.chars().count() + 4000);
     }
 }

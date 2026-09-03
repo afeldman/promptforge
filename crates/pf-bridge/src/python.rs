@@ -201,6 +201,14 @@ impl LlmBridge for PythonBridge {
                 .and_then(|m| m.as_str())
                 .map(str::to_string),
             duration_ms: Some(duration_ms),
+            system_prompt: value
+                .get("system_prompt")
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
+            user_prompt: value
+                .get("user_prompt")
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
         })
     }
 }

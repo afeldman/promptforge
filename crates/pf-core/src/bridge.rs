@@ -105,6 +105,14 @@ pub struct LlmResponse {
     pub model: Option<String>,
     #[serde(default)]
     pub duration_ms: Option<u64>,
+    /// Echo des tatsächlich verwendeten System-Prompts (Debug-Trace).
+    /// Wird von der Python-Schicht zurückgemeldet, weil die System-Prompts
+    /// dort gelebt werden — nur für Trace-Zwecke, niemals geloggt.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Echo des tatsächlich gesendeten User-Prompts (Debug-Trace).
+    #[serde(default)]
+    pub user_prompt: Option<String>,
 }
 
 impl LlmResponse {
@@ -184,6 +192,8 @@ mod tests {
             usage: None,
             model: None,
             duration_ms: None,
+            system_prompt: None,
+            user_prompt: None,
         };
         let v = resp.parse_content_json().unwrap();
         assert_eq!(v["ok"], true);

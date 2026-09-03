@@ -103,6 +103,9 @@ impl LlmBridge for MockBridge {
             }),
             model: request.model.clone().or_else(|| Some("mock".to_string())),
             duration_ms: Some(1),
+            // Rust-Mock kennt keine Python-System-Prompts: Echo des Requests.
+            system_prompt: request.system_prompt.clone(),
+            user_prompt: Some(request.user_prompt.clone()),
         })
     }
 }

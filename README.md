@@ -49,7 +49,7 @@ Für den apfel-Integrationstest zusätzlich: aktive Apple Intelligence.
 
 ```bash
 make setup    # uv sync + Python-Checks; auf macOS: installiert apfel via brew, falls es fehlt
-make verify   # fmt + lint + test + build (+ apfel-Integrationstest auf macOS/arm64)
+make verify   # fmt + lint + test + build (deterministisch, inkl. Compiler-Smoke; ohne apfel)
 ```
 
 Auf macOS installiert `make setup` bei fehlendem `apfel` automatisch
@@ -57,8 +57,25 @@ Auf macOS installiert `make setup` bei fehlendem `apfel` automatisch
 
 ```bash
 make build        # cargo build --release → target/release/prompt-forge
+make test-compiler  # deterministischer Compiler-Smoke (CompilationResult, --no-llm)
 make test-apfel   # tests/providers/apfel/smoke.sh (echter LLM-Pfad, eigener Server-Lifecycle)
+make verify-all   # deterministisches verify + apfel-Integrationstest (opt-in)
 ```
+
+Für die lokale Entwicklung kann der apfel-Server separat im Hintergrund
+laufen (Lifecycle über `scripts/apfel.sh`, PID/Logs unter
+`~/.prompt-forge/state/apfel/` — nichts im Repository):
+
+```bash
+make apfel-start   # startet apfel --serve im Hintergrund (idempotent, wartet auf /health)
+make apfel-status  # Installation/Status/Health/Modell anzeigen
+make test-apfel    # nutzt den laufenden Server (kein zweiter Server)
+make apfel-stop    # beendet nur den von apfel-start verwalteten Server
+```
+
+`make verify` ist bewusst deterministisch und hängt nicht von der
+stochastischen Modellqualität des apfel-Real-LLM-Tests ab; der echte
+LLM-Pfad läuft separat über `make test-apfel` bzw. `make verify-all`.
 
 Auf Linux/Windows überspringt das Makefile macOS-/apfel-Schritte sauber
 (`make verify` scheitert dort nicht am fehlenden apfel). Einzelheiten:
@@ -127,10 +144,61 @@ prompt-forge compile input.txt
 prompt-forge compile input.txt -o result.md        # Prompt in Datei
 prompt-forge compile "…" --copy                     # in die Zwischenablage
 prompt-forge compile "…" --json                     # komplettes Ergebnis als JSON
+prompt-forge compile "…" --debug                    # Debug-Trace auf stderr (echte Prompts/Antworten, redigiert)
+prompt-forge compile "…" --debug-json -o debug.json # Debug-Trace als JSON (Datei via -o, sonst stdout)
+prompt-forge compile "…" --format yaml              # Envelope als YAML
+prompt-forge compile "…" --format toon              # Envelope als TOON
+prompt-forge compile "…" --format json -o result.json
+prompt-forge compile - --format text < intent.txt   # stdin (auch als `-`)
 prompt-forge compile "…" --no-llm                   # deterministisch (kein LLM)
 prompt-forge serve                                  # HTTP-API (127.0.0.1:8770)
 prompt-forge tui                                    # interaktive TUI
 ```
+
+### Ausgabeformate (v0.2)
+
+`compile` unterstützt vier Ausgabeformate über `--format` (Default `text`):
+
+```text
+text    = ausführbarer, fertiger Prompt (direkt in ein Target-LLM kopierbar)
+json    = strukturierter CompilationResult-Envelope als JSON
+yaml    = derselbe Envelope als YAML (gleiches Datenmodell)
+toon    = derselbe Envelope als TOON (Token-Oriented Object Notation)
+```
+
+`--json` ist der Legacy-Alias für `--format json` (semantisch identisch;
+v0.1-Schlüssel `request_id`, `llm_used`, `stages`, `ir`, `long_prompt`,
+`optimized_prompt`, `token_report`, `verification` bleiben zusätzlich zu den
+kanonischen v0.2-Feldern `input`, `prompt_ir`, `expanded_prompt`, `metrics`
+erhalten). Bei `-o` bestimmt `--format` das Format — die Dateiendung wird
+nicht geraten. `--copy` kopiert exakt die erzeugte Ausgabe (Prompt bei
+`text`, serialisierten Envelope bei `json`/`yaml`/`toon`).
+
+### Debug-Trace (`--debug` / `--debug-json`)
+
+```bash
+prompt-forge compile "auditiere das projekt" --debug
+prompt-forge compile "auditiere das projekt" --debug-json -o debug.json
+```
+
+`--debug` schreibt nach der normalen Ausgabe einen menschlesbaren Trace auf
+stderr (Pipeline-Stufen + je LLM-Call die tatsächlich gesendeten System-/
+User-Prompts und die rohe Antwort, abgeschnitten). `--debug-json` macht den
+Trace zur primären Ausgabe (JSON-Datei via `-o`, sonst stdout):
+
+```json
+{ "input": "…", "llm_used": true, "stages": [ … ] }
+```
+
+Jede Stufe (`architect`, `expand`, `optimize`, `verify`) ist vorhanden;
+LLM-Stufen tragen `attempts` mit `system_prompt`/`user_prompt`/
+`raw_response` aus dem tatsächlichen Request/Response-Pfad (die
+Python-Schicht echoed die tatsächlich verwendeten Prompt-Texte). Stufen ohne
+LLM (`expand`, oder `--no-llm`) sind mit `"llm": false` + Hinweis markiert —
+es wird nie ein künstliches `raw_response` erzeugt. Mehrere Optimize-/
+Verify-Versuche erscheinen als separate `attempt`-Einträge. Secrets werden
+redigiert (bekannte Werte, `Bearer …`, `sk-…`, `key=…`). Auch bei
+Pipeline-Fehlern wird ein partieller Trace geschrieben.
 
 Scriptbar: ohne TTY (Pipe/Umleitung) schreibt `compile` den optimierten
 Prompt auf stdout, Statistiken auf stderr. Am TTY erscheint nach dem Lauf ein

@@ -13,7 +13,9 @@ use crossterm::terminal::{
 use pf_core::config::AppConfig;
 use pf_core::error::{ErrorKind, Result, err};
 use pf_core::token::TokenReport;
-use pf_engine::{CompileOutcome, Engine, StageEvent, Verdict, VerificationReport};
+use pf_engine::{
+    CompilationResult, Engine, QualityMetrics, StageEvent, Verdict, VerificationReport,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -82,7 +84,7 @@ pub fn run_tui(cfg: &AppConfig, engine: Arc<Engine>) -> Result<()> {
 
 enum UiMsg {
     Stage(StageEvent),
-    Done(Box<std::result::Result<CompileOutcome, pf_core::PfError>>),
+    Done(Box<std::result::Result<CompilationResult, pf_core::PfError>>),
 }
 
 #[allow(clippy::collapsible_if)] // Event-Loop-Struktur bleibt lesbar
@@ -186,12 +188,15 @@ fn event_loop(
                     StageEvent::Note(note) => {
                         app.status = note;
                     }
+                    // Debug-Trace-Events (--debug/--debug-json) interessieren
+                    // die TUI nicht; hier nur abfangen.
+                    StageEvent::LlmTrace { .. } => {}
                 },
                 UiMsg::Done(boxed) => match *boxed {
                     Ok(outcome) => {
                         app.token_report = Some(outcome.token_report.clone());
                         app.verification = Some(outcome.verification.clone());
-                        app.long_prompt = Some(outcome.long_prompt.clone());
+                        app.long_prompt = Some(outcome.expanded_prompt.clone());
                         app.optimized_prompt = Some(outcome.optimized_prompt.clone());
                         app.running = false;
                         app.status = match outcome.verification.verdict {
@@ -214,30 +219,37 @@ fn event_loop(
     }
 }
 
-fn current_outcome(app: &TuiApp) -> Option<CompileOutcome> {
-    Some(CompileOutcome {
+fn current_outcome(app: &TuiApp) -> Option<CompilationResult> {
+    let token_report = app.token_report.clone()?;
+    let verification = app.verification.clone()?;
+    let metrics = QualityMetrics::compute(&verification, &token_report);
+    Some(CompilationResult {
+        input: app.input.trim().to_string(),
         request_id: "tui".to_string(),
-        ir: pf_core::ir::PromptIr::new("tui", ""),
-        long_prompt: app.long_prompt.clone()?,
-        optimized_prompt: app.optimized_prompt.clone()?,
-        token_report: app.token_report.clone()?,
-        verification: app.verification.clone()?,
         llm_used: true,
-        stages_done: app.stages.iter().map(|(s, _)| s.clone()).collect(),
-        usage: Vec::new(),
-        optimizer_events: Vec::new(),
+        stages: app.stages.iter().map(|(s, _)| s.clone()).collect(),
+        prompt_ir: pf_core::ir::PromptIr::new("tui", ""),
+        expanded_prompt: app.long_prompt.clone()?,
+        optimized_prompt: app.optimized_prompt.clone()?,
+        token_report,
+        verification,
+        metrics,
     })
 }
 
 /// Speichert Artefakte des letzten Laufs (kleiner Duplikat-Anteil zu pf-cli,
 /// um die TUI unabhängig vom CLI-Crate zu halten).
-fn pf_cli_save(cfg: &AppConfig, outcome: &CompileOutcome) -> Result<String> {
+fn pf_cli_save(cfg: &AppConfig, outcome: &CompilationResult) -> Result<String> {
     let layout = pf_core::path::HomeLayout::from_root(&cfg.home);
     layout.ensure()?;
-    let ir_json = outcome.ir.to_json()?;
+    let ir_json = outcome.prompt_ir.to_json()?;
     let ir_path = pf_core::persist::save_artifact(&layout.generated_dir, "ir", "json", &ir_json)?;
-    let long_path =
-        pf_core::persist::save_artifact(&layout.generated_dir, "long", "md", &outcome.long_prompt)?;
+    let long_path = pf_core::persist::save_artifact(
+        &layout.generated_dir,
+        "long",
+        "md",
+        &outcome.expanded_prompt,
+    )?;
     let opt_path = pf_core::persist::save_artifact(
         &layout.optimized_dir,
         "optimized",
@@ -247,10 +259,10 @@ fn pf_cli_save(cfg: &AppConfig, outcome: &CompileOutcome) -> Result<String> {
     let entry = pf_core::persist::HistoryEntry {
         request_id: outcome.request_id.clone(),
         created_at: pf_core::path::rfc3339_now(),
-        intent: None,
+        intent: Some(outcome.input.clone()),
         model: None,
         token_report: serde_json::to_value(&outcome.token_report).ok(),
-        stages: outcome.stages_done.clone(),
+        stages: outcome.stages.clone(),
         status: "ok".to_string(),
         ir_path: Some(ir_path.display().to_string()),
         long_prompt_path: Some(long_path.display().to_string()),

@@ -19,6 +19,7 @@ pub enum ErrorKind {
     Verification,
     Persistence,
     Bridge,
+    Serialization,
     Json,
     Io,
     InvalidInput,
@@ -37,7 +38,7 @@ impl ErrorKind {
             | ErrorKind::Timeout => 4,
             ErrorKind::Tokenization | ErrorKind::Optimization | ErrorKind::Verification => 5,
             ErrorKind::Persistence => 6,
-            ErrorKind::Bridge | ErrorKind::Json | ErrorKind::Io => 7,
+            ErrorKind::Bridge | ErrorKind::Serialization | ErrorKind::Json | ErrorKind::Io => 7,
         }
     }
 
@@ -63,6 +64,7 @@ impl std::fmt::Display for ErrorKind {
             ErrorKind::Verification => "verification",
             ErrorKind::Persistence => "persistence",
             ErrorKind::Bridge => "bridge",
+            ErrorKind::Serialization => "serialization",
             ErrorKind::Json => "json",
             ErrorKind::Io => "io",
             ErrorKind::InvalidInput => "invalid_input",

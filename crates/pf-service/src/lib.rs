@@ -76,16 +76,36 @@ async fn compile_handler(
         .and_then(|r| r);
     match outcome {
         Ok(o) => {
-            let payload = serde_json::json!({
-                "request_id": o.request_id,
-                "llm_used": o.llm_used,
-                "stages": o.stages_done,
-                "long_prompt": o.long_prompt,
-                "optimized_prompt": o.optimized_prompt,
-                "token_report": o.token_report,
-                "verification": o.verification,
-            });
-            (StatusCode::OK, Json(payload)).into_response()
+            // v0.2 (additiv): optionales `format` → serialisierte Ausgabe.
+            if let Some(fmt_str) = &body.format {
+                return match pf_core::OutputFormat::parse_loose(fmt_str) {
+                    Ok(fmt) => {
+                        let output = match fmt {
+                            pf_core::OutputFormat::Text => o.optimized_prompt.clone(),
+                            _ => {
+                                match pf_core::serialize::render_structured(fmt, &o.envelope_json())
+                                {
+                                    Ok(s) => s,
+                                    Err(e) => return error_response(e),
+                                }
+                            }
+                        };
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "format": fmt.as_str(),
+                                "output": output,
+                                "input": o.input,
+                            })),
+                        )
+                            .into_response()
+                    }
+                    Err(e) => error_response(e),
+                };
+            }
+            // Default (kein format): v0.2-Envelope — kanonische Felder +
+            // v0.1-Aliase (request_id/llm_used/stages/long_prompt/… bleiben).
+            (StatusCode::OK, Json(o.envelope_json())).into_response()
         }
         Err(e) => error_response(e),
     }
@@ -187,7 +207,13 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct CompileRequest {
+    /// Intent; `input` wird als Alias akzeptiert (v0.2-Design §28).
+    #[serde(alias = "input")]
     pub intent: String,
+    /// Optionales Ausgabeformat (text|json|yaml|toon). Fehlt das Feld,
+    /// liefert der Endpoint den Envelope (bisheriges Verhalten).
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -320,5 +346,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn compile_endpoint_supports_format_yaml_additive() {
+        let cfg = AppConfig::load(Some(std::path::Path::new("/tmp/pf-svc-test"))).unwrap();
+        let engine = Arc::new(Engine::new(
+            Box::new(MockBridge::new()),
+            Arc::new(HeuristicTokenizer),
+            EngineConfig {
+                llm: Default::default(),
+                verify: VerifyConfig::default(),
+            },
+            pf_core::config::ProviderKind::Mock,
+        ));
+        let app = router(AppState { engine, cfg });
+        use tower::ServiceExt;
+        // v0.1-Schlüssel `intent` und v0.2-Alias `input` funktionieren beide;
+        // `format` wird additiv akzeptiert.
+        let body = serde_json::json!({
+            "input": "Analysiere fünf Papers und vergleiche die Methoden",
+            "format": "yaml"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/compile")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["format"], "yaml");
+        let yaml_out = v["output"].as_str().unwrap();
+        assert!(yaml_out.contains("input:"));
+        assert!(yaml_out.contains("verification:"));
+        assert!(yaml_out.contains("metrics:"));
+    }
+
+    #[tokio::test]
+    async fn compile_endpoint_rejects_invalid_format() {
+        let cfg = AppConfig::load(Some(std::path::Path::new("/tmp/pf-svc-test"))).unwrap();
+        let engine = Arc::new(Engine::new(
+            Box::new(MockBridge::new()),
+            Arc::new(HeuristicTokenizer),
+            EngineConfig {
+                llm: Default::default(),
+                verify: VerifyConfig::default(),
+            },
+            pf_core::config::ProviderKind::Mock,
+        ));
+        let app = router(AppState { engine, cfg });
+        use tower::ServiceExt;
+        let body = serde_json::json!({
+            "intent": "Analysiere fünf Papers",
+            "format": "banana"
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/compile")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

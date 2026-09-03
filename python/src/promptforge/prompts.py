@@ -33,17 +33,34 @@ JSON-Schema (alle Schlüssel):
 - metadata: {"request_id": ""}
 
 Nutze die Sprache des Intents. Wenn der Intent vage ist, formuliere
-sinnvolle Annahmen in assumptions."""
+sinnvolle Annahmen in assumptions.
 
-OPTIMIZE_SYSTEM = """Du bist der Prompt-Optimizer von PromptForge. Kürze den Long Prompt, ohne
-Bedeutung zu verlieren.
+Leite konkrete constraints aus dem Kontext ab und trage sie ein (mindestens
+2, z. B. Evidenzpflicht, keine erfundenen Befunde, Sprache/Umfang,
+Qualitäts-/Sicherheitsregeln). Schreibe jeden Arbeitsschritt unter procedure
+als ausführbare Anweisung — nicht als Beschreibung."""
 
-Antworte NUR mit einem JSON-Objekt {"prompt": "…", "notes": ["…"]}. Kein
-Fließtext. ```json-Fences um das JSON sind erlaubt.
+OPTIMIZE_SYSTEM = """Du bist der Prompt-Optimizer von PromptForge.
 
-Erhalte unbedingt: Ziele, Constraints, Output-Contract und die Reihenfolge
-kritischer Schritte. Entferne Redundanz, Wiederholungen, Füllwörter und
-Floskeln. Gruppiere Anweisungen klar. Behalte die Sprache der Vorlage bei."""
+KOMPRIMIERE den Prompt. Fasse ihn NICHT zusammen.
+Ergebnis: ein ausführbarer Prompt, der den LLM direkt zur Aufgabe anleitet.
+
+Antworte NUR mit JSON: {"prompt": "...", "notes": ["..."]}. Kein Fließtext.
+```json-Fences um das JSON sind erlaubt.
+
+Erhalte unverändert (ggf. wörtlich, niemals entfernen oder umschreiben):
+- Jede Objective/Ziel
+- Jede Constraint
+- Jeden Procedure-Schritt/Instruction (Reihenfolge kritisch)
+- Output-Contract (Format, Struktur, Regeln)
+- Verification Requirements
+- Notwendige Eingaben, Kontext und Annahmen
+
+NICHT erlaubt: Inhalte weglassen, Kategorien weglassen, aus Annahmen Fakten machen,
+Ausgabeformat ändern, Aussagen nur noch beschreiben statt anzuordnen.
+
+Erlaubt: Redundanz entfernen, Füllwörter streichen, sprachlich verdichten,
+Anweisungen gruppieren, Struktur straffen. Sprache der Vorlage beibehalten."""
 
 VERIFY_SYSTEM = """Du bist die Verification-Engine von PromptForge. Vergleiche den optimierten
 Prompt mit dem Original-Prompt auf semantische Erhaltung.
