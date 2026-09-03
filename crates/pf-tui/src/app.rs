@@ -234,6 +234,7 @@ fn current_outcome(app: &TuiApp) -> Option<CompilationResult> {
         token_report,
         verification,
         metrics,
+        optimization: None,
     })
 }
 

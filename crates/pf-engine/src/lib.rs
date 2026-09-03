@@ -4,6 +4,7 @@
 
 pub mod expand;
 pub mod mock;
+pub mod optimization;
 pub mod optimizer;
 pub mod pipeline;
 pub mod verify;

@@ -93,6 +93,27 @@ pub fn compile_and_save(
     Ok(CompileReport { outcome, saved })
 }
 
+/// Normalisiert die CLI-Optimizer-Auswahl (`--optimizer`) auf kanonische
+/// Strategie-Namen. Unbekannte Werte sind ein Konfigurationsfehler.
+pub fn normalize_optimizer(s: &str) -> std::result::Result<&'static str, pf_core::error::PfError> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => Ok("auto"),
+        "baseline" => Ok("baseline"),
+        "redundancy" => Ok("redundancy"),
+        "instruction" => Ok("instruction"),
+        "structural" => Ok("structural"),
+        "semantic" => Ok("semantic"),
+        "combined" => Ok("combined"),
+        _ => Err(pf_core::error::PfError::new(
+            pf_core::ErrorKind::InvalidInput,
+            format!(
+                "Ungültiger Optimizer '{s}' (erwartet: auto | baseline | redundancy | \
+                 instruction | structural | semantic | combined)"
+            ),
+        )),
+    }
+}
+
 /// Artefakte + History-Eintrag schreiben.
 pub fn save_outcome(cfg: &AppConfig, outcome: &CompilationResult) -> Result<SaveResult> {
     let layout = HomeLayout::from_root(&cfg.home);

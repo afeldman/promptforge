@@ -140,3 +140,35 @@ Response 200:
   vollständigen Prompts (nur opt-in `PF_PROMPT_LOG=1`).
 - Für Remote-Zugriff: Reverse-Proxy mit Auth; Secrets gehören in die
   Umgebung, nicht in Requests.
+
+## v1.0: Optimization-Report in strukturierten Formaten
+
+Seit v1.0 enthält der CompilationResult-Envelope (json/yaml/toon) zusätzlich
+den additiven Schlüssel `optimization` (nur wenn die Engine lief):
+
+```json
+"optimization": {
+  "input_tokens": 250,
+  "baseline_tokens": 250,
+  "optimization_status": "optimized",
+  "selected": "structural",
+  "score": 0.98,
+  "guard_recovered_atoms_total": 0,
+  "candidates": [
+    { "strategy": "redundancy", "input_tokens": 250, "pre_guard_tokens": 210,
+      "output_tokens": 205, "token_efficiency": 0.18,
+      "semantic_fidelity": 0.99, "structural_validity": true,
+      "verification": "pass", "guard_recovered_atoms": 0,
+      "guard_recovery_ratio": 0.0 }
+  ]
+}
+```
+
+`optimization_status`: `optimized` | `no_improvement` | `degraded`. Bei
+`no_improvement` ist `optimized_prompt` der Long Prompt (keine künstliche
+Verschlechterung). Der Report erscheint identisch im Debug-Trace-Dokument
+(`--debug-json`).
+
+CLI: `compile --optimizer auto|baseline|redundancy|instruction|structural|semantic|combined`
+(Default `auto`). Kein Breaking Change — strukturierte Antworten ohne Engine-
+Report sind weiterhin gültig (Feld fehlt dann einfach).

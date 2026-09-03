@@ -64,6 +64,9 @@ pub struct TraceDoc {
     /// Pipeline-Notizen (z. B. Guard-Wiederherstellungen, Re-Optimize).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// v1.0-Optimization-Report (additiv, sofern Ergebnis vorhanden).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optimization: Option<pf_core::OptimizationReport>,
 }
 
 impl TraceDoc {
@@ -173,6 +176,7 @@ fn build_trace_inner(outcome: Option<&CompilationResult>, events: &[StageEvent])
         llm_used,
         stages,
         notes,
+        optimization: outcome.and_then(|o| o.optimization.clone()),
     }
 }
 

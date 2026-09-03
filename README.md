@@ -59,6 +59,8 @@ Auf macOS installiert `make setup` bei fehlendem `apfel` automatisch
 make build        # cargo build --release → target/release/prompt-forge
 make test-compiler  # deterministischer Compiler-Smoke (CompilationResult, --no-llm)
 make test-apfel   # tests/providers/apfel/smoke.sh (echter LLM-Pfad, eigener Server-Lifecycle)
+make optimizer-test   # v1.0-Optimization-Engine: fokussierte Rust-Tests
+make optimizer-benchmark  # deterministischer Optimizer-Benchmark (Strategie-Matrix, --no-llm)
 make verify-all   # deterministisches verify + apfel-Integrationstest (opt-in)
 ```
 
@@ -151,9 +153,36 @@ prompt-forge compile "…" --format toon              # Envelope als TOON
 prompt-forge compile "…" --format json -o result.json
 prompt-forge compile - --format text < intent.txt   # stdin (auch als `-`)
 prompt-forge compile "…" --no-llm                   # deterministisch (kein LLM)
+prompt-forge compile "…" --optimizer structural     # v1.0: nur Structural Compression
+prompt-forge compile "…" --optimizer auto           # v1.0: alle Strategien (Default)
 prompt-forge serve                                  # HTTP-API (127.0.0.1:8770)
 prompt-forge tui                                    # interaktive TUI
 ```
+
+### Optimization Engine (v1.0)
+
+Seit v1.0 ist die einzelne Optimize-Stufe eine **Kandidaten-Engine**: Pro
+Kompilierung erzeugt der Optimization Planner mehrere Kandidaten, hygienisiert
+und guardet jeden einzeln, verifiziert strukturell gegen die Prompt IR und
+wählt den besten gültigen aus. **Optimierungsziel: maximale Tokenreduktion bei
+maximaler Erhaltung** — ein kürzerer Prompt ist kein Erfolg, wenn Information
+verloren geht. Niemals wird ein Ergebnis verwendet, das größer ist als der Long
+Prompt (`optimization_status = no_improvement` statt künstlicher Verschlechterung).
+
+Deterministische Strategien (in Rust, kein LLM nötig):
+
+```text
+redundancy   = Füll-/Subsumptions-Redundanz entfernen (Token-Containment-Beweis)
+instruction  = Prosa-Hedges zu Imperativen verdichten (konservative Ersetzungen)
+structural   = kompakte ausführbare Struktur direkt aus der Prompt IR
+semantic     = konservative semantische Deduplikation (nur beweisbare Subsumption)
+combined     = redundancy + instruction + semantic
+```
+
+Bei LLM-Betrieb kommt zusätzlich der bisherige LLM-Optimizer als Kandidat
+`llm` hinzu. Kandidaten-Sichtbarkeit: strukturierte Formate enthalten
+`optimization` (status, selected, candidates mit tokens/semantic/guard),
+`--debug-json` zusätzlich im Trace-Dokument.
 
 ### Ausgabeformate (v0.2)
 

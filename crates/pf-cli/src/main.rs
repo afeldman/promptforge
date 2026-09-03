@@ -32,7 +32,7 @@ enum Cmd {
     /// Legt User-Home + Default-Konfiguration an
     Init,
     /// Kompiliert einen Intent zu einem optimierten Prompt
-    Compile(CompileArgs),
+    Compile(Box<CompileArgs>),
     /// Startet den lokalen HTTP-Service
     Serve,
     /// Startet die interaktive TUI
@@ -58,6 +58,10 @@ struct CompileArgs {
     /// Ausgabeformat: text | json | yaml | toon (Default: text)
     #[arg(long, default_value = "text")]
     format: String,
+    /// Optimizer-Strategie: auto | baseline | redundancy | instruction |
+    /// structural | semantic | combined (Default: auto)
+    #[arg(long, default_value = "auto")]
+    optimizer: String,
     /// Debug-Trace (echte Prompts/Antworten, redigiert) als Text auf stderr
     #[arg(long)]
     debug: bool,
@@ -116,7 +120,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Compile(args) => run_compile(&mut cfg, args),
+        Cmd::Compile(args) => run_compile(&mut cfg, *args),
         Cmd::Serve => {
             let engine = Arc::new(pf_cli::app::build_engine(&cfg)?);
             pf_service::serve(&cfg, engine)
@@ -155,6 +159,9 @@ fn run_compile(cfg: &mut AppConfig, args: CompileArgs) -> Result<()> {
         format = pf_core::OutputFormat::Json;
     }
 
+    // Optimizer-Strategie validieren (v1.0, additiv; Default "auto").
+    let optimizer_mode = pf_cli::app::normalize_optimizer(&args.optimizer)?;
+
     // Intent-Quelle: Argument > Datei > stdin; explizites `-` = stdin (auch tty).
     // Wichtig: piped stdin nur lesen, wenn NICHT `-` verwendet wird (sonst
     // wäre der Stream bereits konsumiert).
@@ -173,6 +180,7 @@ fn run_compile(cfg: &mut AppConfig, args: CompileArgs) -> Result<()> {
         && !args.json
         && !args.debug
         && !args.debug_json
+        && args.optimizer == "auto"
         && format == pf_core::OutputFormat::Text
         && args.out.is_none();
 
@@ -198,7 +206,7 @@ fn run_compile(cfg: &mut AppConfig, args: CompileArgs) -> Result<()> {
                 }
             })
         };
-        let compile_result = engine.compile(&intent, Some(cb));
+        let compile_result = engine.compile_with_optimizer(&intent, Some(cb), optimizer_mode);
         let trace_events: Vec<StageEvent> = trace_sink
             .map(|s| {
                 std::rc::Rc::try_unwrap(s)

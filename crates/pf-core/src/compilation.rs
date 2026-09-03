@@ -27,6 +27,24 @@ pub struct QualityMetrics {
     /// Token-Effizienz relativ: 1 - optimized/generated.
     /// > 0 kleiner, = 0 gleich, < 0 größer (0 wenn nichts generiert wurde).
     pub token_efficiency: f64,
+    // --- v1.0 (additiv, optional) ---
+    /// Einschätzung der Instruktionsqualität (0..1), soweit ermittelbar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_quality: Option<f64>,
+    /// Output-Contract-Qualität (0..1), soweit ermittelbar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_contract_quality: Option<f64>,
+    /// Anteil erhaltener Constraints (0..1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint_preservation: Option<f64>,
+    /// Anteil erhaltener technischer Token/Spans (0..1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub technical_token_preservation: Option<f64>,
+    /// Anzahl entfernter redundanter Zeilen/Sätze (Messwert).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy_removed: Option<u64>,
+    // (optimization_strategy lebt im OptimizationReport, nicht hier — der
+    // Metrik-Typ bleibt Copy-fähig.)
 }
 
 impl QualityMetrics {
@@ -41,8 +59,66 @@ impl QualityMetrics {
             semantic_fidelity: verification.semantic_preservation,
             structural_validity: verification.all_preserved(),
             token_efficiency,
+            ..Default::default()
         }
     }
+}
+
+/// Ergebnis-Status der Optimierungs-Engine (v1.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizationStatus {
+    /// Ein kleinerer, gültiger Kandidat wurde ausgewählt.
+    Optimized,
+    /// Kein Kandidat war kleiner und gültig → Original beibehalten.
+    #[default]
+    NoImprovement,
+    /// Akzeptiert trotz negativer Token-Bilanz (nur mit explizitem Grund).
+    Degraded,
+}
+
+/// Bewerteter Optimierungs-Kandidat (v1.0).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CandidateReport {
+    /// Strategie-Name (z. B. "redundancy", "structural", "combined", "baseline").
+    pub strategy: String,
+    /// Tokens des Eingabe-Prompts (Long Prompt).
+    pub input_tokens: u64,
+    /// Tokens vor dem Guard-Pass.
+    pub pre_guard_tokens: u64,
+    /// Tokens nach dem Guard-Pass (= Kandidaten-Text).
+    pub output_tokens: u64,
+    /// Token-Effizienz: 1 - output/input (>0 kleiner).
+    pub token_efficiency: f64,
+    /// Semantik-Erhalt des Kandidaten (strukturell/LLM, 0..1).
+    pub semantic_fidelity: f64,
+    /// Strukturelle Gültigkeit (alle Erhaltungs-Kategorien).
+    pub structural_validity: bool,
+    /// Verifikation: "pass" | "fail".
+    pub verification: String,
+    /// Vom Guard wiederhergestellte Atome (separat gemessen).
+    pub guard_recovered_atoms: u32,
+    /// Guard-Recovery-Verhältnis (0..1): guard_recovered/atoms_total.
+    pub guard_recovery_ratio: f64,
+}
+
+/// Optimization-Report der v1.0-Engine (in CompilationResult enthalten).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct OptimizationReport {
+    /// Tokens des Eingabe-Prompts (Long Prompt).
+    pub input_tokens: u64,
+    /// Tokens der deterministischen/LLM-Baseline.
+    pub baseline_tokens: u64,
+    /// Alle bewerteten Kandidaten (Reihenfolge = Bewertung).
+    pub candidates: Vec<CandidateReport>,
+    /// Gewählte Strategie, falls optimiert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
+    /// Gesamtscore des gewählten Kandidaten.
+    pub score: f64,
+    pub optimization_status: OptimizationStatus,
+    /// Summe der Guard-Recovery über die Kandidaten.
+    pub guard_recovered_atoms_total: u32,
 }
 
 /// Vollständiges, formatneutrales Kompilier-Ergebnis der Engine (v0.2).
@@ -69,6 +145,10 @@ pub struct CompilationResult {
     pub verification: VerificationReport,
     /// v0.2-Qualitätsmetriken (Phase-1-Minimalumfang).
     pub metrics: QualityMetrics,
+    /// v1.0-Optimization-Report (additiv, optional — nur gesetzt, wenn die
+    /// Engine einen Lauf durchgeführt hat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimization: Option<OptimizationReport>,
 }
 
 impl CompilationResult {
@@ -152,6 +232,7 @@ mod tests {
             token_report: sample_token_report(),
             verification: sample_verification(),
             metrics: QualityMetrics::default(),
+            optimization: None,
         }
     }
 

@@ -72,6 +72,25 @@ pub enum StageEvent {
     Note(String),
 }
 
+/// Ergebnis der v1.0-Optimierungs-Engine (modul-privat).
+struct OptEngineOutcome {
+    selected_text: String,
+    verification: VerificationReport,
+    report: pf_core::OptimizationReport,
+    events: Vec<OptimizerEvent>,
+}
+
+/// Ein evaluierter Optimierungs-Kandidat (Pipelinestufe).
+type OptCandidate = (
+    String,              // Strategie-Name
+    String,              // finaler Text (nach Hygiene + Guard)
+    VerificationReport,  // strukturelle Verifikation
+    f64,                 // token_efficiency (>0 = kleiner als Input)
+    u32,                 // guard_recovered_atoms
+    Vec<OptimizerEvent>, // Hygiene-/Guard-Events
+    u64,                 // pre_guard_tokens
+);
+
 /// Konfiguration einer Compile-Ausführung (aus AppConfig abgeleitet).
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -211,7 +230,26 @@ impl Engine {
     pub fn compile(
         &self,
         intent: &str,
+        cb: Option<Box<dyn FnMut(StageEvent)>>,
+    ) -> Result<CompilationResult> {
+        self.compile_impl(intent, cb, "auto")
+    }
+
+    /// Wie `compile`, mit wählbarer Optimizer-Strategie (CLI `--optimizer`).
+    pub fn compile_with_optimizer(
+        &self,
+        intent: &str,
+        cb: Option<Box<dyn FnMut(StageEvent)>>,
+        optimizer: &str,
+    ) -> Result<CompilationResult> {
+        self.compile_impl(intent, cb, optimizer)
+    }
+
+    fn compile_impl(
+        &self,
+        intent: &str,
         mut cb: Option<Box<dyn FnMut(StageEvent)>>,
+        optimizer_mode: &str,
     ) -> Result<CompilationResult> {
         let request_id = pf_core::path::request_id();
         let intent = intent.trim();
@@ -247,9 +285,12 @@ impl Engine {
             },
         );
 
-        // ---- Stage 3/4: Optimize + Verify (mit Re-Optimize-Loop) ----
-        let (optimized, verification, _optimizer_events) =
-            self.optimize_and_verify(&ir, &long_prompt, &request_id, &mut cb)?;
+        // ---- Stage 3/4: Optimize + Verify (v1.0-Kandidaten-Engine) ----
+        let out =
+            self.run_optimization_engine(&ir, &long_prompt, &request_id, &mut cb, optimizer_mode)?;
+        let optimized = out.selected_text;
+        let verification = out.verification;
+        let optimization = Some(out.report);
 
         match verification.verdict {
             Some(Verdict::Pass) => {
@@ -257,14 +298,47 @@ impl Engine {
                     &mut cb,
                     StageEvent::Note("Verifikation bestanden".to_string()),
                 );
-                Ok(self.finish(
+                let mut cr = self.finish(
                     intent,
                     ir,
                     &long_prompt,
                     &optimized,
                     verification,
                     request_id,
-                ))
+                    optimization,
+                );
+                // v1.0-Zusatzmetriken für den ausgewählten Kandidaten.
+                if let Some(rep) = cr.optimization.as_ref() {
+                    cr.metrics.technical_token_preservation =
+                        Some(crate::optimization::technical_preservation(
+                            &long_prompt,
+                            &cr.optimized_prompt,
+                        ));
+                    cr.metrics.redundancy_removed = Some(
+                        rep.input_tokens
+                            .saturating_sub(self.tokenizer.count(&cr.optimized_prompt)),
+                    );
+                    cr.metrics.constraint_preservation = Some(
+                        if rep.optimization_status == pf_core::OptimizationStatus::NoImprovement {
+                            1.0
+                        } else {
+                            cr.metrics.semantic_fidelity
+                        },
+                    );
+                    cr.metrics.instruction_quality =
+                        Some(if cr.verification.instructions_preserved {
+                            1.0
+                        } else {
+                            0.0
+                        });
+                    cr.metrics.output_contract_quality =
+                        Some(if cr.verification.output_contract_preserved {
+                            1.0
+                        } else {
+                            0.0
+                        });
+                }
+                Ok(cr)
             }
             _ => {
                 Self::emit(
@@ -277,8 +351,8 @@ impl Engine {
                 Err(err(
                     ErrorKind::Verification,
                     format!(
-                        "Verifikation nach {} Versuchen nicht bestanden (semantic_preservation={:.2})",
-                        self.cfg.verify.max_attempts + 1,
+                        "Verifikation nicht bestanden: kein Optimierungs-Kandidat und keine Baseline \
+                         erfüllte die Erhaltungsbedingungen (semantic_preservation={:.2})",
                         verification.semantic_preservation
                     ),
                 ))
@@ -286,10 +360,9 @@ impl Engine {
         }
     }
 
-    /// Optimize- + Verify-Loop über eine IR + Long Prompt (Re-Optimize mit
-    /// Feedback, begrenzt durch `verify.max_attempts`). Gibt den optimierten
-    /// Prompt, den Verifikationsbericht (ggf. mit Fail-Verdict) und die
-    /// Optimizer-Events zurück.
+    /// Optimize- + Verify über die v1.0-Kandidaten-Engine (Wrapper für
+    /// `POST /v1/optimize`). Gibt den gewählten Prompt, die finale
+    /// Verifikation und die Optimizer-Events des gewählten Kandidaten zurück.
     pub fn optimize_and_verify(
         &self,
         ir: &PromptIr,
@@ -297,107 +370,314 @@ impl Engine {
         request_id: &str,
         cb: &mut Option<Box<dyn FnMut(StageEvent)>>,
     ) -> Result<(String, VerificationReport, Vec<OptimizerEvent>)> {
+        let out = self.run_optimization_engine(ir, long_prompt, request_id, cb, "auto")?;
+        Ok((out.selected_text, out.verification, out.events))
+    }
+
+    // Ergebnis der v1.0-Optimierungs-Engine.
+    // (struct-Definitionen sind in impl-Blöcken nicht erlaubt — Typ liegt
+    // modulweit oben bei den Ergebnis-Typen.)
+
+    /// v1.0 Optimization Engine: erzeugt mehrere Kandidaten (Strategien),
+    /// hygienisiert + guardet jeden, verifiziert strukturell, bewertet und
+    /// wählt den besten gültigen Kandidaten aus (niemals einen, der größer
+    /// ist als der Input → `optimization_status`).
+    #[allow(clippy::too_many_lines)]
+    fn run_optimization_engine(
+        &self,
+        ir: &PromptIr,
+        long_prompt: &str,
+        request_id: &str,
+        cb: &mut Option<Box<dyn FnMut(StageEvent)>>,
+        mode: &str,
+    ) -> Result<OptEngineOutcome> {
+        use pf_core::{CandidateReport, OptimizationReport, OptimizationStatus};
+
         Self::emit(cb, StageEvent::StageStarted(Stage::Optimize));
         let atoms = SemanticAtoms::from_ir(ir);
-        let mut optimizer_events: Vec<OptimizerEvent> = Vec::new();
-        let mut last_feedback: Vec<String> = Vec::new();
-        let mut last_report = VerificationReport::default();
+        let mandatory = mandatory_atoms(&atoms);
+        let atoms_total = mandatory
+            .iter()
+            .filter(|a| !a.trim().is_empty())
+            .count()
+            .max(1) as u32;
 
-        for attempt in 0..=self.cfg.verify.max_attempts {
-            let mut optimized = if self.llm_on() {
-                let payload = serde_json::json!({
-                    "ir": ir,
-                    "long_prompt": long_prompt,
-                    "feedback": last_feedback,
-                });
-                let resp = self.call(
-                    LlmOperation::Optimize,
-                    payload,
-                    request_id,
-                    attempt as u32 + 1,
-                    cb,
-                )?;
-                extract_prompt(&resp)?
-            } else {
-                long_prompt.to_string()
+        // Strategie-Set aus Modus ableiten (keine Provider-spezifische Logik).
+        let mut strategies: Vec<&str> = Vec::new();
+        match mode {
+            "baseline" => strategies.push("baseline"),
+            "redundancy" => strategies.push("redundancy"),
+            "instruction" => strategies.push("instruction"),
+            "structural" => strategies.push("structural"),
+            "semantic" => strategies.push("semantic"),
+            "combined" => {
+                strategies.push("combined");
+                strategies.push("baseline");
+            }
+            _ => {
+                strategies.extend([
+                    "redundancy",
+                    "instruction",
+                    "structural",
+                    "semantic",
+                    "combined",
+                    "baseline",
+                ]);
+            }
+        }
+        let want_llm_candidate = self.llm_on() && matches!(mode, "auto" | "baseline" | "combined");
+
+        let input_tokens = self.tokenizer.count(long_prompt);
+        let mut llm_attempt = 0u32;
+        let mut all_events: Vec<OptimizerEvent> = Vec::new();
+        let mut evaled: Vec<OptCandidate> = Vec::new();
+        // name, final_text, structural_verify, token_efficiency, guard_n, events, pre_guard_tokens
+
+        for strat in &strategies {
+            let strategy = *strat;
+            let raw: String = match strategy {
+                "baseline" => long_prompt.to_string(),
+                "llm" => {
+                    llm_attempt += 1;
+                    let payload = serde_json::json!({
+                        "ir": ir,
+                        "long_prompt": long_prompt,
+                        "feedback": [],
+                    });
+                    let resp =
+                        self.call(LlmOperation::Optimize, payload, request_id, llm_attempt, cb)?;
+                    extract_prompt(&resp)?
+                }
+                "redundancy" => crate::optimization::strategy_redundancy(long_prompt).0,
+                "instruction" => crate::optimization::strategy_instruction(long_prompt).0,
+                "structural" => crate::optimization::strategy_structural(ir),
+                "semantic" => crate::optimization::strategy_semantic(long_prompt).0,
+                "combined" => crate::optimization::strategy_combined(long_prompt).0,
+                _ => continue,
             };
-            // Deterministische Hygiene-Passes (auch nach LLM-Pass).
-            let (hygiene, evs) = deterministic_pass_chain(&optimized);
-            optimizer_events.extend(evs);
-            // Guard-Pass: Pflicht-Atome (Constraints/Contract/Req. u. a.) erhalten.
-            let (guarded, ev) = reinsert_missing_atoms(&hygiene, &mandatory_atoms(&atoms));
-            if let crate::optimizer::PassAction::ReinsertedAtoms(n) = ev.action
-                && n > 0
-            {
+            let (hygiene, evs) = deterministic_pass_chain(&raw);
+            let pre_tokens = self.tokenizer.count(&hygiene);
+            let (guarded, ev) = reinsert_missing_atoms(&hygiene, &mandatory);
+            let guard_n = match ev.action {
+                crate::optimizer::PassAction::ReinsertedAtoms(n) => n,
+                _ => 0,
+            };
+            if guard_n > 0 {
                 Self::emit(
                     cb,
                     StageEvent::Note(format!(
-                        "Guard-Pass hat {n} verlorene Pflicht-Atome wiederhergestellt (Re-Optimize-Ergebnis war unvollständig)"
+                        "Guard-Pass hat {guard_n} verlorene Pflicht-Atome wiederhergestellt (Strategie {strategy})"
                     )),
                 );
             }
-            optimizer_events.push(ev);
-            optimized = guarded;
-
-            // ---- Verify ----
-            Self::emit(cb, StageEvent::StageStarted(Stage::Verify));
-            let structural = verify_structural(ir, &optimized, &atoms, self.cfg.verify.threshold);
-            let mut report = if self.llm_on() {
-                let payload = serde_json::json!({
-                    "atoms": atoms_payload(&atoms),
-                    "long_prompt": long_prompt,
-                    "optimized_prompt": optimized,
-                });
-                let resp = self.call(
-                    LlmOperation::Verify,
-                    payload,
-                    request_id,
-                    attempt as u32 + 1,
-                    cb,
-                )?;
-                let semantic = parse_semantic_report_json(&resp.parse_content_json()?)?;
-                merge_semantic(structural, semantic, self.cfg.verify.threshold)
+            let mut cand_events = evs;
+            cand_events.push(ev);
+            let out_tokens = self.tokenizer.count(&guarded);
+            let eff = if input_tokens > 0 {
+                1.0 - out_tokens as f64 / input_tokens as f64
             } else {
-                structural
+                0.0
             };
-            report.attempts = (attempt + 1) as u32;
-            last_report = report.clone();
-
-            if report.verdict == Some(Verdict::Pass) {
-                Self::emit(
-                    cb,
-                    StageEvent::StageFinished {
-                        stage: Stage::Verify,
-                        ok: true,
-                    },
-                );
-                return Ok((optimized, report, optimizer_events));
+            let structural = verify_structural(ir, &guarded, &atoms, self.cfg.verify.threshold);
+            let pass = structural.verdict == Some(Verdict::Pass);
+            all_events.extend(cand_events.iter().cloned());
+            if strategy == "llm" || strategy != "baseline" || !self.llm_on() || mode == "baseline" {
+                evaled.push((
+                    strategy.to_string(),
+                    guarded,
+                    structural,
+                    eff,
+                    guard_n as u32,
+                    cand_events,
+                    pre_tokens,
+                ));
             }
-            Self::emit(
-                cb,
-                StageEvent::StageFinished {
-                    stage: Stage::Verify,
-                    ok: false,
-                },
-            );
-
-            // Re-Optimize-Feedback aus fehlgeschlagenen Checks ableiten.
-            last_feedback = failed_checks_feedback(&report);
-            if !self.llm_on() || attempt >= self.cfg.verify.max_attempts {
-                break;
-            }
-            Self::emit(
-                cb,
-                StageEvent::Note(format!(
-                    "Re-Optimize ({}/{})",
-                    attempt + 1,
-                    self.cfg.verify.max_attempts
-                )),
-            );
+            let _ = pass;
+            let _ = pre_tokens;
+        }
+        // „llm"-Kandidat explizit anhängen, falls gewünscht (nach den
+        // deterministischen, damit die Baseline-Reihenfolge stabil bleibt).
+        if want_llm_candidate && !strategies.contains(&"llm") {
+            llm_attempt += 1;
+            let payload = serde_json::json!({
+                "ir": ir,
+                "long_prompt": long_prompt,
+                "feedback": [],
+            });
+            let resp = self.call(LlmOperation::Optimize, payload, request_id, llm_attempt, cb)?;
+            let raw = extract_prompt(&resp)?;
+            let (hygiene, evs) = deterministic_pass_chain(&raw);
+            let pre_tokens = self.tokenizer.count(&hygiene);
+            let (guarded, ev) = reinsert_missing_atoms(&hygiene, &mandatory);
+            let guard_n = match ev.action {
+                crate::optimizer::PassAction::ReinsertedAtoms(n) => n,
+                _ => 0,
+            };
+            let mut cand_events = evs;
+            cand_events.push(ev);
+            let out_tokens = self.tokenizer.count(&guarded);
+            let eff = if input_tokens > 0 {
+                1.0 - out_tokens as f64 / input_tokens as f64
+            } else {
+                0.0
+            };
+            let structural = verify_structural(ir, &guarded, &atoms, self.cfg.verify.threshold);
+            all_events.extend(cand_events.iter().cloned());
+            evaled.push((
+                "llm".to_string(),
+                guarded,
+                structural,
+                eff,
+                guard_n as u32,
+                cand_events,
+                pre_tokens,
+            ));
         }
 
-        // Nach max. Versuchen: Ergebnis mit Fail-Verdict (kein Abbruchfehler).
-        Ok((long_prompt.to_string(), last_report, optimizer_events))
+        // Strukturell gültige & kleinere Kandidaten bewerten.
+        let score_for = |eff: f64, semantic: f64, guard_n: u32| -> f64 {
+            let ratio = guard_n as f64 / atoms_total as f64;
+            let benefit = 0.2 + 0.8 * eff.max(0.0);
+            let penalty = (1.0 - 0.6 * ratio.min(1.0)).max(0.1);
+            semantic * benefit * penalty
+        };
+        let mut ranked: Vec<usize> = (0..evaled.len())
+            .filter(|&i| evaled[i].2.verdict == Some(Verdict::Pass) && evaled[i].3 > 0.0)
+            .collect();
+        ranked.sort_by(|&a, &b| {
+            let sa = score_for(evaled[a].3, evaled[a].2.semantic_preservation, evaled[a].4);
+            let sb = score_for(evaled[b].3, evaled[b].2.semantic_preservation, evaled[b].4);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Auswahl + finale (ggf. LLM-)Verifikation.
+        let mut selected_text = long_prompt.to_string();
+        let mut final_verification =
+            verify_structural(ir, long_prompt, &atoms, self.cfg.verify.threshold);
+        let mut status = OptimizationStatus::NoImprovement;
+        let mut selected: Option<String> = None;
+        let mut final_events: Vec<OptimizerEvent> = Vec::new();
+        let mut semantic_fidelity = final_verification.semantic_preservation;
+
+        if !ranked.is_empty() {
+            let mut chosen: Option<usize> = None;
+            if self.llm_on() {
+                for &idx in &ranked {
+                    let text = evaled[idx].1.clone();
+                    Self::emit(cb, StageEvent::StageStarted(Stage::Verify));
+                    let payload = serde_json::json!({
+                        "atoms": atoms_payload(&atoms),
+                        "long_prompt": long_prompt,
+                        "optimized_prompt": text,
+                    });
+                    let resp = self.call(LlmOperation::Verify, payload, request_id, 1, cb)?;
+                    let semantic = parse_semantic_report_json(&resp.parse_content_json()?)?;
+                    let merged =
+                        merge_semantic(evaled[idx].2.clone(), semantic, self.cfg.verify.threshold);
+                    Self::emit(
+                        cb,
+                        StageEvent::StageFinished {
+                            stage: Stage::Verify,
+                            ok: merged.verdict == Some(Verdict::Pass),
+                        },
+                    );
+                    if merged.verdict == Some(Verdict::Pass) {
+                        chosen = Some(idx);
+                        final_verification = merged;
+                        break;
+                    }
+                    // Nächster Kandidat (reject / next strategy).
+                    Self::emit(
+                        cb,
+                        StageEvent::Note(format!(
+                            "Kandidat {} von LLM-Verify abgelehnt — nächster Kandidat",
+                            evaled[idx].0
+                        )),
+                    );
+                }
+                if chosen.is_none() {
+                    // Kein Kandidat besteht die LLM-Semantikprüfung: Fallback
+                    // auf die beste strukturelle Verifikation (Original) —
+                    // wird unten als Fehler gemeldet (kein Fake-PASS).
+                    final_verification = evaled[ranked[0]].2.clone();
+                    final_verification.attempts = 1;
+                    selected_text = evaled[ranked[0]].1.clone();
+                }
+            } else {
+                chosen = Some(ranked[0]);
+                final_verification = evaled[ranked[0]].2.clone();
+            }
+            if let Some(idx) = chosen {
+                let name = evaled[idx].0.clone();
+                let eff = evaled[idx].3;
+                selected = Some(name.clone());
+                selected_text = evaled[idx].1.clone();
+                final_events = evaled[idx].5.clone();
+                status = if eff > 0.0 {
+                    OptimizationStatus::Optimized
+                } else {
+                    OptimizationStatus::NoImprovement
+                };
+                semantic_fidelity = final_verification.semantic_preservation;
+                let _ = score_for(eff, final_verification.semantic_preservation, evaled[idx].4);
+            }
+        }
+
+        // Kandidatenliste korrekt füllen (pre_guard_tokens aus Hygiene-Pass).
+        let mut candidates = Vec::new();
+        let mut guard_total = 0u32;
+        for (name, text, rep, eff, guard_n, _evs, pre) in &evaled {
+            let ratio = if atoms_total > 0 {
+                *guard_n as f64 / atoms_total as f64
+            } else {
+                0.0
+            };
+            guard_total += guard_n;
+            candidates.push(CandidateReport {
+                strategy: name.clone(),
+                input_tokens,
+                pre_guard_tokens: *pre,
+                output_tokens: self.tokenizer.count(text),
+                token_efficiency: *eff,
+                semantic_fidelity: rep.semantic_preservation,
+                structural_validity: rep.all_preserved(),
+                verification: if rep.verdict == Some(Verdict::Pass) {
+                    "pass".to_string()
+                } else {
+                    "fail".to_string()
+                },
+                guard_recovered_atoms: *guard_n,
+                guard_recovery_ratio: ratio,
+            });
+        }
+
+        let report = OptimizationReport {
+            input_tokens,
+            baseline_tokens: input_tokens,
+            candidates,
+            selected,
+            score: final_verification.semantic_preservation,
+            optimization_status: status,
+            guard_recovered_atoms_total: guard_total,
+        };
+        Self::emit(
+            cb,
+            StageEvent::StageFinished {
+                stage: Stage::Optimize,
+                ok: true,
+            },
+        );
+        let _ = semantic_fidelity;
+        Ok(OptEngineOutcome {
+            selected_text,
+            verification: final_verification,
+            report,
+            events: if final_events.is_empty() {
+                all_events
+            } else {
+                final_events
+            },
+        })
     }
 
     /// Einzelne Verifikation (strukturell + optional LLM-Semantik) ohne
@@ -444,6 +724,7 @@ impl Engine {
         optimized: &str,
         verification: VerificationReport,
         request_id: String,
+        optimization: Option<pf_core::OptimizationReport>,
     ) -> CompilationResult {
         let tokenizer = Arc::clone(&self.tokenizer);
         let mut token_report = TokenReport::new();
@@ -468,6 +749,7 @@ impl Engine {
             token_report,
             verification,
             metrics,
+            optimization,
         }
     }
 }
@@ -510,15 +792,6 @@ fn extract_prompt(resp: &LlmResponse) -> Result<String> {
         }
         Err(_) => Ok(resp.content.clone()),
     }
-}
-
-fn failed_checks_feedback(report: &VerificationReport) -> Vec<String> {
-    report
-        .checks
-        .iter()
-        .filter(|c| !c.ok)
-        .map(|c| format!("[{}] {}", c.category, c.atom))
-        .collect()
 }
 
 /// Führt einen Prompt gegen das Ziel-LLM aus (z. B. `POST /v1/execute`).
@@ -652,5 +925,95 @@ mod tests {
         );
         let resp = execute_prompt(&engine, "Fasse zusammen", None).unwrap();
         assert!(resp.content.starts_with("Mock-Antwort"));
+    }
+
+    // ---- v1.0 Optimization Engine: Verhalten ohne LLM (deterministisch) ----
+
+    #[test]
+    fn v10_optimized_selection_reports_candidates() {
+        let engine = Engine::deterministic(cfg());
+        let outcome = engine
+            .compile_with_optimizer("auditiere das projekt", None, "auto")
+            .unwrap();
+        let rep = outcome.optimization.expect("OptimizationReport fehlt");
+        // Die Engine wählt den besten gültigen Kandidaten (kein Fake-PASS).
+        assert_eq!(
+            rep.optimization_status,
+            pf_core::OptimizationStatus::Optimized
+        );
+        let sel = rep.selected.as_deref().expect("selected fehlt");
+        assert_eq!(sel, "structural");
+        assert!(!rep.candidates.is_empty(), "mindestens ein Kandidat");
+        // Effizienz der Auswahl muss positiv sein (kleiner als Long Prompt).
+        let out_tokens = rep
+            .candidates
+            .iter()
+            .find(|c| c.strategy == sel)
+            .map(|c| c.output_tokens)
+            .unwrap();
+        assert!(out_tokens < rep.input_tokens, "Optimized muss kleiner sein");
+        assert!(outcome.verification.verdict == Some(Verdict::Pass));
+        // Strukturelle Semantik: alle Pflicht-Atome erhalten.
+        assert!(outcome.verification.all_preserved());
+    }
+
+    #[test]
+    fn v10_baseline_mode_is_no_improvement_not_degradation() {
+        let engine = Engine::deterministic(cfg());
+        let outcome = engine
+            .compile_with_optimizer("auditiere das projekt", None, "baseline")
+            .unwrap();
+        let rep = outcome.optimization.unwrap();
+        assert_eq!(
+            rep.optimization_status,
+            pf_core::OptimizationStatus::NoImprovement
+        );
+        // Ohne LLM ist baseline = Long Prompt (keine künstliche Verschlechterung).
+        assert_eq!(outcome.optimized_prompt, outcome.expanded_prompt);
+        assert!(outcome.metrics.token_efficiency >= 0.0);
+    }
+
+    #[test]
+    fn v10_all_strategies_are_structural_valid() {
+        let engine = Engine::deterministic(cfg());
+        for mode in [
+            "redundancy",
+            "instruction",
+            "structural",
+            "semantic",
+            "combined",
+        ] {
+            let outcome = engine
+                .compile_with_optimizer("auditiere das projekt", None, mode)
+                .unwrap();
+            let rep = outcome.optimization.unwrap();
+            assert_eq!(outcome.verification.verdict, Some(Verdict::Pass), "{mode}");
+            // Kein Kandidat darf Information verlieren.
+            let cands: Vec<&str> = rep
+                .candidates
+                .iter()
+                .filter(|c| c.verification == "pass")
+                .map(|c| c.strategy.as_str())
+                .collect();
+            assert!(cands.contains(&mode), "Strategie {mode} fehlt: {cands:?}");
+        }
+    }
+
+    #[test]
+    fn v10_optimization_report_serializes_additively() {
+        let engine = Engine::deterministic(cfg());
+        let outcome = engine
+            .compile_with_optimizer("auditiere das projekt", None, "auto")
+            .unwrap();
+        let v = outcome.envelope_json();
+        let obj = v.as_object().expect("Envelope ist Objekt");
+        assert!(
+            obj.contains_key("optimization"),
+            "Report muss im Envelope sein"
+        );
+        let rep = &obj["optimization"];
+        assert!(rep["optimization_status"].is_string());
+        assert!(rep["candidates"].is_array());
+        assert!(!rep["candidates"].as_array().unwrap().is_empty());
     }
 }

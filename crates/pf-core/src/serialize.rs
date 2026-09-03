@@ -311,7 +311,9 @@ mod tests {
                 semantic_fidelity: 0.98,
                 structural_validity: true,
                 token_efficiency: 0.25,
+                ..Default::default()
             },
+            optimization: None,
         }
     }
 

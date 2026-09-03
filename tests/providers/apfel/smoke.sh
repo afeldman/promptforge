@@ -256,4 +256,75 @@ ok "Optimization erfolgreich"
 ok "Verification erfolgreich"
 ok "CompilationResult vorhanden (input/prompt_ir/expanded_prompt/metrics)"
 ok "finaler Prompt vorhanden"
-echo "PASS: PromptForge ↔ apfel integration"
+
+# --- 10. v1.0 Optimization-Engine: echter Benchmark (realer LLM-Pfad) ---
+# Mehrere Intents (Kurz/Deutsch + technisch/englisch + langer technischer
+# Prompt mit Constraints, Code/CLI, Pfaden, URL). Kein Mock.
+OPT_INTENTS=(
+    "auditiere das projekt"
+    "Audit the project architecture, identify security risks, check dependency management, verify test coverage and produce an actionable report without modifying source files."
+    "Prüfe das Repository unter /Users/dev/probe auf Sicherheitsprobleme. Führe cargo audit und cargo deny check aus, bewerte die CI-Workflow-Datei .github/workflows/ci.yml, prüfe Abhängigkeiten gegen https://osv.dev und erstelle einen Bericht nach docs/report.md. Ändere keine Quelldateien und keine Konfigurationen."
+)
+
+opt_bad=0
+i=0
+for intent in "${OPT_INTENTS[@]}"; do
+    i=$((i + 1))
+    out_json="${TMP_DIR}/opt-${i}.json"
+    err_file="${TMP_DIR}/opt-${i}.err"
+    START_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
+    "${BIN}" compile --json "${intent}" >"${out_json}" 2>"${err_file}"
+    rc=$?
+    END_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
+    lat=$((END_MS - START_MS))
+    if [ "${rc}" -ne 0 ]; then
+        echo "--- optimizer benchmark intent ${i}: stderr ---" >&2
+        cat "${err_file}" >&2
+        echo "FAIL: optimizer benchmark intent ${i} (exit ${rc})" >&2
+        opt_bad=1
+        continue
+    fi
+    python3 - "${out_json}" "${i}" "${lat}" "${MODEL}" <<'PY' || opt_bad=1
+import json, sys
+d = json.load(open(sys.argv[1]))
+i, lat, model = int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+o = d.get("optimization") or {}
+cands = o.get("candidates") or []
+tr = d.get("token_report") or {}
+v = d.get("verification") or {}
+gen = int(tr.get("generated") or 0)
+out = int(tr.get("optimized") or 0)
+red = (1.0 - out / gen) * 100.0 if gen else 0.0
+problems = []
+if o.get("optimization_status") not in ("optimized", "no_improvement"):
+    problems.append("status=%s" % o.get("optimization_status"))
+if not cands:
+    problems.append("keine Kandidaten")
+if not any(c.get("strategy") == "structural" for c in cands):
+    problems.append("structural-Kandidat fehlt")
+if not any(c.get("verification") == "pass" for c in cands):
+    problems.append("kein passender Kandidat")
+if not o.get("selected") and o.get("optimization_status") == "optimized":
+    problems.append("selected fehlt bei optimized")
+if v.get("verdict") != "pass":
+    problems.append("verdict=%s" % v.get("verdict"))
+m = d.get("metrics") or {}
+if "technical_token_preservation" not in m:
+    problems.append("technical_token_preservation fehlt")
+if problems:
+    print("INTENT %d: PROBLEME %s" % (i, ", ".join(problems)))
+    sys.exit(1)
+sel = o.get("selected") or "-"
+print("INTENT %d | Model %s | gen=%d → out=%d (Reduktion %.1f%%) | status=%s selected=%s | semantic %.2f | technical %.2f | %d Kandidaten | %d ms"
+      % (i, model, gen, out, red, o.get("optimization_status"), sel,
+         float(v.get("semantic_preservation") or 0.0),
+         float(m.get("technical_token_preservation") or 1.0),
+         len(cands), lat))
+PY
+done
+if [ "${opt_bad}" -ne 0 ]; then
+    fail "Optimization-Benchmark nicht bestanden (siehe oben; echte LLM-Ausgaben, kein Mock)"
+fi
+ok "Optimization-Engine: Benchmark über ${i} Intents erfolgreich (echte apfel-Calls)"
+
+echo "PASS: PromptForge ↔ apfel integration (inkl. v1.0 Optimization Engine)"

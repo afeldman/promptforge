@@ -17,7 +17,9 @@ pub mod token;
 pub mod verify;
 
 pub use bridge::{LlmBridge, LlmOperation, LlmRequest, LlmResponse, Usage};
-pub use compilation::{CompilationResult, QualityMetrics};
+pub use compilation::{
+    CandidateReport, CompilationResult, OptimizationReport, OptimizationStatus, QualityMetrics,
+};
 pub use config::{
     AppConfig, DEFAULT_CONFIG_TOML, FileConfig, LlmConfig, LogConfig, ProviderKind, ServiceConfig,
     VerifyConfig,

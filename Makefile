@@ -30,6 +30,8 @@ help: ## Zeigt diese Hilfe
 	@printf '  make test-rust   Run cargo test --workspace\n'
 	@printf '  make test-python Run Python tests via uv (pytest)\n'
 	@printf '  make test-compiler  Deterministic compiler smoke (CompilationResult, --no-llm)\n'
+	@printf '  make optimizer-test   v1.0-Optimization-Engine Rust-Tests (deterministisch)\n'
+	@printf '  make optimizer-benchmark  Deterministischer Optimizer-Benchmark (--no-llm, Strategie-Matrix)\n'
 	@printf '  make lint        Run clippy (warnings = Fehler)\n'
 	@printf '  make fmt         Check formatting (cargo fmt)\n'
 	@printf '  make test-apfel  Run macOS/apfel integration test (real LLM, stochastisch)\n'
@@ -99,6 +101,15 @@ test-python: ## Python-Tests via uv (pytest)
 test-compiler: build ## Deterministischer Compiler-Smoke gegen das Release-Binary (CompilationResult, --no-llm)
 	@printf '==> tests/compiler-smoke.sh\n'
 	@./tests/compiler-smoke.sh
+
+optimizer-test: ## v1.0-Optimization-Engine: fokussierte Rust-Tests (deterministisch)
+	@printf '==> cargo test -p pf-engine --lib (optimization + v10_*)\n'
+	@cargo test -p pf-engine --lib optimization
+	@cargo test -p pf-engine --lib v10_
+
+optimizer-benchmark: build ## Deterministischer Optimizer-Benchmark (kein LLM; Strategie-Matrix)
+	@printf '==> tests/optimizer/benchmark.sh (deterministisch, --no-llm)\n'
+	@./tests/optimizer/benchmark.sh
 
 # --- Format / Lint ---
 
@@ -175,4 +186,4 @@ clean: ## Entfernt Build-Artefakte (nur Build-Artefakte; niemals ~/.prompt-forge
 	@cargo clean
 	@printf 'Clean: target/ entfernt. Python-Env (.venv) bleibt erhalten.\n'
 
-.PHONY: help setup setup-python setup-macos build test test-rust test-python test-compiler fmt lint apfel apfel-start apfel-stop apfel-status test-apfel verify verify-all clean
+.PHONY: help setup setup-python setup-macos build test test-rust test-python test-compiler optimizer-test optimizer-benchmark fmt lint apfel apfel-start apfel-stop apfel-status test-apfel verify verify-all clean
