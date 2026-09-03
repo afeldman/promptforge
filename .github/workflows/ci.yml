@@ -38,6 +38,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98
+          components: rustfmt, clippy
       
       - name: Install uv (Python Package Manager)
         uses: astral-sh/setup-uv@v3
