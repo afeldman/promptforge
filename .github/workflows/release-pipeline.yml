@@ -1,0 +1,238 @@
+# PromptForge — Reusable Release Pipeline
+#
+# Single source of truth for release validation, build and publication.
+# Called by:
+#   - release.yml         (tag push  -> publish = true)
+#   - release-manual.yml  (dispatch  -> publish = !dry_run)
+#
+# Gates (all must pass before a release is published):
+#   validate  fmt + clippy + rust tests + pytest + compiler smoke + version consistency
+#   audit     cargo-audit (RUSTSEC advisories)
+#   build     release binary per target, packaged + checksummed, uploaded as artifact
+#   release   downloads artifacts, verifies checksums, creates the GitHub release
+#
+# Security: caller-supplied strings (release_tag, checkout_ref) are passed to
+# shell steps through `env:` only — never interpolated directly into `run:` —
+# and release_tag is format-checked before any other step runs.
+
+name: Release Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: Git ref (tag / branch / sha) to validate and build.
+        required: true
+        type: string
+      release_tag:
+        description: Release tag name, e.g. v1.0.0. Drives artifact names and version checks.
+        required: true
+        type: string
+      publish:
+        description: Create the GitHub release when every gate passes.
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
+  UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/python/.venv
+
+jobs:
+  guard:
+    name: Guard inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release tag format
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release_tag '$RELEASE_TAG' must look like v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+          echo "release_tag OK: $RELEASE_TAG"
+
+  validate:
+    name: Validate
+    needs: guard
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Setup Python environment (PyO3)
+        run: uv sync --frozen --project python
+
+      - name: Version consistency (tag == Cargo == pyproject)
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${RELEASE_TAG#v}"
+
+          CARGO_VERSION="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "pf-core") | .version')"
+          PY_VERSION="$(grep -oP '^version\s*=\s*"\K[^"]+' python/pyproject.toml)"
+
+          echo "tag=$TAG_VERSION  cargo=$CARGO_VERSION  pyproject=$PY_VERSION"
+
+          [ -n "$CARGO_VERSION" ] || { echo "::error::cargo metadata returned an empty version"; exit 1; }
+          [[ "$CARGO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || { echo "::error::cargo version '$CARGO_VERSION' is not semver"; exit 1; }
+          [ "$TAG_VERSION" = "$CARGO_VERSION" ] || { echo "::error::tag ($TAG_VERSION) != Cargo workspace version ($CARGO_VERSION)"; exit 1; }
+          [ "$TAG_VERSION" = "$PY_VERSION" ]  || { echo "::error::tag ($TAG_VERSION) != python/pyproject.toml version ($PY_VERSION)"; exit 1; }
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked -- --test-threads=1
+
+      - name: pytest
+        run: uv run --project python pytest
+
+      - name: Compiler smoke test
+        run: |
+          cargo build --release --locked --bin prompt-forge
+          ./tests/compiler-smoke.sh
+
+  audit:
+    name: Security Audit
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit --deny warnings
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Setup Python environment (PyO3)
+        run: uv sync --frozen --project python
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "$TARGET" --bin prompt-forge
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/prompt-forge"
+          [ -x "$BIN" ] || { echo "::error::release binary missing: $BIN"; exit 1; }
+
+          NAME="prompt-forge-${RELEASE_TAG}-${TARGET}"
+          mkdir -p dist
+          tar -czf "dist/${NAME}.tar.gz" -C "target/${TARGET}/release" prompt-forge
+          ( cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          shasum -a 256 -c "dist/${NAME}.tar.gz.sha256"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [validate, audit, build]
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate + verify checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      - name: Create GitHub release
+        run: |
+          set -euo pipefail
+          PRERELEASE=()
+          [[ "$RELEASE_TAG" =~ -[a-zA-Z] ]] && PRERELEASE=(--prerelease)
+
+          if gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists — uploading assets only."
+            gh release upload "$RELEASE_TAG" --repo "$REPO" --clobber \
+              dist/*.tar.gz dist/SHA256SUMS
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$REPO" \
+              --title "PromptForge $RELEASE_TAG" \
+              --generate-notes \
+              "${PRERELEASE[@]}" \
+              dist/*.tar.gz dist/SHA256SUMS
+          fi
