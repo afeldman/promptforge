@@ -14,13 +14,18 @@ on:
   pull_request:
     branches: [master, main]
 
+permissions:
+  contents: read
+
 env:
   # Python-Version für PyO3 (exakt wie in python/.venv). Absolut über
   # github.workspace — kein impliziter, cwd-abhängiger Pfad.
   PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
+  UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/python/.venv
+  CARGO_TERM_COLOR: always
 
-  # Rust Toolchain (aus Cargo.toml: rust-version = "1.98")
-  RUST_VERSION: 1.98
+  # CI-Toolchain-Pin. Muss >= workspace.package.rust-version (1.88) sein.
+  RUST_VERSION: "1.98"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -38,21 +43,20 @@ jobs:
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.98
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
-      
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Install uv (Python Package Manager)
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      
+
       # Python-Umgebung setuppen (exakt wie `make setup-python`)
       - name: Setup Python Environment (uv sync)
-        run: |
-          cd python
-          uv sync --frozen
-        env:
-          UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/python/.venv
+        run: uv sync --frozen --project python
       
       - name: Verify Python Binary Exists and Version
         run: |
@@ -166,19 +170,20 @@ jobs:
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.98
-      
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: apfel
+
       - name: Install uv (Python Package Manager)
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      
+
       - name: Setup Python Environment (uv sync)
-        run: |
-          cd python
-          uv sync --frozen
-        env:
-          UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/python/.venv
+        run: uv sync --frozen --project python
       
       - name: Verify Python Binary Exists and Version (macOS)
         run: |

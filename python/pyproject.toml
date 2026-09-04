@@ -1,6 +1,6 @@
 [project]
 name = "promptforge"
-version = "0.1.0"
+version = "1.0.0"
 description = "PromptForge Python AI layer: LLM-Provider-Abstraktion und LLM-gestützte Architect/Optimize/Verify-Passes"
 requires-python = ">=3.11"
 dependencies = [

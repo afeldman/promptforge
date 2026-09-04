@@ -1,377 +1,48 @@
-# PromptForge — Manual Release Workflow
+# PromptForge — Release (manual)
 #
-# Manueller Release-Workflow für diagnostische Zwecke oder Testing
+# Manually dispatch the full release pipeline against any ref for diagnostics
+# or to cut a release without pushing a tag first.
+#
+#   dry_run = true  (default)  -> validate + audit + build only, no release
+#   dry_run = false            -> also publish the GitHub release for release_tag
+#
+# All logic lives in release-pipeline.yml (shared with release.yml).
 
 name: Release (Manual)
 
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Git Tag zu releasen (Format: vMAJOR.MINOR.PATCH)'
+      ref:
+        description: Branch, tag or SHA to validate and build.
         required: true
+        default: master
         type: string
-        default: 'v1.0.0'
+      release_tag:
+        description: Version tag (vMAJOR.MINOR.PATCH[-pre]). Used for artifact names, version checks and — unless dry-run — the release.
+        required: true
+        default: v1.0.0
+        type: string
       dry_run:
-        description: 'Nur Validierung ausführen, kein Release erstellen?'
-        required: false
+        description: Validate and build only — do not create a GitHub release.
+        required: true
+        default: true
         type: boolean
-        default: false
-
-env:
-  GH_TOKEN: ${{ github.token }}
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-manual-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  validate-manual-release:
-    name: Manual Release Validation
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.extract-version.outputs.version }}
-      tag_name: ${{ steps.extract-version.outputs.tag_name }}
-      is_dry_run: ${{ github.event.inputs.dry_run == 'true' }}
-    
-    steps:
-      - name: Checkout latest commit (for manual release)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      
-      - name: Extract version from requested tag
-        id: extract-version
-        run: |
-          REQUESTED_TAG="${{ github.event.inputs.tag }}"
-          
-          # Validate tag format
-          if ! [[ "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.*)?$ ]]; then
-            echo "Invalid tag format: $REQUESTED_TAG"
-            echo "Expected format: vMAJOR.MINOR.PATCH[-pre-release]"
-            exit 1
-          fi
-          
-          # Remove 'v' prefix
-          VERSION="${REQUESTED_TAG#v}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag_name=$REQUESTED_TAG" >> $GITHUB_OUTPUT
-      
-      - name: Display manual release info
-        run: |
-          echo "=== Manual Release ==="
-          echo "Tag: ${{ github.event.inputs.tag }}"
-          echo "Version: ${{ steps.extract-version.outputs.version }}"
-          echo "Dry Run: ${{ github.event.inputs.dry_run }}"
-
-  validate-consistency-manual:
-    name: Version Consistency Check (Manual)
-    runs-on: ubuntu-latest
-    needs: validate-manual-release
-    env:
-      GH_TOKEN: ${{ github.token }}
-    
-    steps:
-      - name: Checkout latest commit
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      
-      - name: Get Cargo version from manifest
-        id: cargo-version
-        run: |
-          CARGO_VERSION=$(grep -oP 'version\s*=\s*"\K[^"]+' Cargo.toml)
-          echo "cargo_version=$CARGO_VERSION" >> $GITHUB_OUTPUT
-          echo "Cargo.toml version: $CARGO_VERSION"
-      
-      - name: Validate version consistency
-        run: |
-          REQUESTED_TAG="${{ github.event.inputs.tag }}"
-          CARGO_VERSION=$(grep -oP 'version\s*=\s*"\K[^"]+' Cargo.toml)
-          
-          echo "Requested Tag: $REQUESTED_TAG"
-          echo "Cargo.toml Version: $CARGO_VERSION"
-          
-          # Remove 'v' from tag for comparison
-          TAG_VERSION="${REQUESTED_TAG#v}"
-          
-          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
-            echo "WARNING: Version mismatch!" >&2
-            echo "Tag version: $TAG_VERSION" >&2
-            echo "Cargo version: $CARGO_VERSION" >&2
-            echo "This may indicate inconsistent versioning"
-          else
-            echo "✓ Versions match: $TAG_VERSION"
-          fi
-
-  validate-python-uv-pyo3-manual:
-    name: Python/uv/PyO3 Setup (Manual)
-    runs-on: ubuntu-latest
-    needs: validate-consistency-manual
-    env:
-      GH_TOKEN: ${{ github.token }}
-      PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
-    
-    steps:
-      - name: Checkout latest commit
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
-        with:
-          enable-cache: true
-      
-      - name: Sync Python environment with uv
-        run: |
-          cd python
-          uv sync --frozen
-          cd ..
-      
-      - name: Verify Python binary exists (CRITICAL for PyO3)
-        run: |
-          PY_BIN="${{ github.workspace }}/python/.venv/bin/python"
-          
-          if [ ! -x "$PY_BIN" ]; then
-            echo "FATAL: Python binary does not exist or is not executable" >&2
-            exit 1
-          fi
-      
-      - name: Verify Python version
-        run: |
-          PY_BIN="${{ github.workspace }}/python/.venv/bin/python"
-          $PY_BIN --version
-
-  validate-format-clippy-manual:
-    name: Code Quality Gates (Manual)
-    runs-on: ubuntu-latest
-    needs: validate-python-uv-pyo3-manual
-    env:
-      GH_TOKEN: ${{ github.token }}
-      PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
-    
-    steps:
-      - name: Checkout latest commit
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      
-      - name: Run cargo fmt --check
-        run: |
-          cargo fmt --all -- --check
-      
-      - name: Run cargo clippy
-        run: |
-          cargo clippy --workspace --all-targets -- -D warnings
-
-  validate-rust-tests-manual:
-    name: Rust Tests (Manual)
-    runs-on: ubuntu-latest
-    needs: validate-format-clippy-manual
-    env:
-      GH_TOKEN: ${{ github.token }}
-      PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
-    
-    steps:
-      - name: Checkout latest commit
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      
-      - name: Run cargo test
-        run: |
-          cargo test --workspace
-
-  validate-python-tests-manual:
-    name: Python Tests (Manual)
-    runs-on: ubuntu-latest
-    needs: validate-rust-tests-manual
-    env:
-      GH_TOKEN: ${{ github.token }}
-      PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
-    
-    steps:
-      - name: Checkout latest commit
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      
-      - name: Run Python pytest
-        working-directory: python
-        run: |
-          uv run pytest
-
-  build-release-manual:
-    name: Release Build (Manual)
-    runs-on: ubuntu-latest
-    needs: [validate-python-tests-manual, validate-format-clippy-manual]
-    env:
-      GH_TOKEN: ${{ github.token }}
-      PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
-    
-    steps:
-      - name: Checkout latest commit
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      
-      - name: Run cargo build --release
-        run: |
-          cargo build --release
-      
-      - name: Verify release binary exists
-        run: |
-          BIN="${{ github.workspace }}/target/release/prompt-forge"
-          
-          if [ ! -x "$BIN" ]; then
-            echo "FATAL: Release binary does not exist: $BIN" >&2
-            exit 1
-          fi
-      
-      - name: Run compiler smoke test
-        run: |
-          ./tests/compiler-smoke.sh
-
-  multi-platform-builds-manual:
-    name: Multi-Platform Builds (Manual)
-    needs: [validate-python-tests-manual, validate-format-clippy-manual]
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: "prompt-forge-${{ github.event.inputs.tag }}-x86_64-unknown-linux-gnu"
-            archive_ext: "tar.gz"
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: "prompt-forge-${{ github.event.inputs.tag }}-x86_64-apple-darwin"
-            archive_ext: "tar.gz"
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: "prompt-forge-${{ github.event.inputs.tag }}-aarch64-apple-darwin"
-            archive_ext: "tar.gz"
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: "prompt-forge-${{ github.event.inputs.tag }}-x86_64-pc-windows-msvc"
-            archive_ext: "zip"
-    
-    runs-on: ${{ matrix.os }}
-    env:
-      GH_TOKEN: ${{ github.token }}
-      PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
-    
-    steps:
-      - name: Checkout latest commit
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      
-      - name: Cross-compile for ${{ matrix.target }}
-        run: |
-          cargo build --release --target ${{ matrix.target }}
-
-      - name: Archive release artifact
-        shell: bash
-        run: |
-          TARGET_DIR="${{ github.workspace }}/target/${{ matrix.target }}/release"
-          OUTPUT_FILE="${{ github.workspace }}/releases/${{ matrix.artifact_name }}.${{ matrix.archive_ext }}"
-          
-          mkdir -p releases
-          
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            cp "${TARGET_DIR}/prompt-forge.exe" "$OUTPUT_FILE"
-          else
-            tar -czf "${OUTPUT_FILE}" -C "$(dirname ${TARGET_DIR})" "$(basename ${TARGET_DIR})/prompt-forge"
-          fi
-      
-      - name: Upload release artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
-          path: |
-            ${{ github.workspace }}/releases/${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
-          if-no-files-found: fail
-
-  create-sha256sums-manual:
-    name: Generate SHA256 Sum File (Manual)
-    needs: multi-platform-builds-manual
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: '*'
-          path: releases
-          merge-multiple: true
-      
-      - name: Generate SHA256 Sum file
-        run: |
-          cd releases
-          sha256sum *.tar.gz *.zip > SHA256SUMS
-          cat SHA256SUMS
-
-  upload-sha256sums-manual:
-    name: Upload SHA256 Sum File (Manual)
-    needs: create-sha256sums-manual
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: '*'
-          path: releases
-          merge-multiple: true
-      
-      - name: Upload SHA256SUMS
-        uses: actions/upload-artifact@v4
-        with:
-          name: SHA256SUMS
-          path: releases/SHA256SUMS
-
-  create-github-release-manual:
-    name: Create GitHub Release (Manual)
-    needs: [upload-sha256sums-manual, validate-manual-release]
-    if: ${{ github.event.inputs.dry_run != 'true' }}
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    
-    steps:
-      - name: Checkout latest commit
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      
-      - name: Download all artifacts for release
-        uses: actions/download-artifact@v4
-        with:
-          pattern: '*'
-          path: releases
-          merge-multiple: true
-      
-      - name: Create GitHub Release
-        run: |
-          VERSION="${{ github.event.inputs.tag }}"
-          
-          gh release create "$VERSION" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "PromptForge $VERSION" \
-            --generate-notes \
-            -F releases/SHA256SUMS \
-            --notes "$(echo '## PromptForge Release Notes\n\nThis is a manual release from tag $VERSION.')" \
-            || {
-              echo "Release may already exist for this tag"
-              exit 0
-            }
+  pipeline:
+    name: Release pipeline
+    uses: ./.github/workflows/release-pipeline.yml
+    permissions:
+      contents: write
+    with:
+      checkout_ref: ${{ inputs.ref }}
+      release_tag: ${{ inputs.release_tag }}
+      publish: ${{ !inputs.dry_run }}

@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.6"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -19,11 +19,11 @@ repository = "https://github.com/afeldman/promptforge.git"
 description = "PromptForge: A framework for building and managing prompt-based applications."
 
 [workspace.dependencies]
-pf-core = { path = "crates/pf-core", version = "0.1.0" }
-pf-engine = { path = "crates/pf-engine", version = "0.1.0" }
-pf-bridge = { path = "crates/pf-bridge", version = "0.1.0" }
-pf-tui = { path = "crates/pf-tui", version = "0.1.0" }
-pf-service = { path = "crates/pf-service", version = "0.1.0" }
+pf-core = { path = "crates/pf-core", version = "1.0.0" }
+pf-engine = { path = "crates/pf-engine", version = "1.0.0" }
+pf-bridge = { path = "crates/pf-bridge", version = "1.0.0" }
+pf-tui = { path = "crates/pf-tui", version = "1.0.0" }
+pf-service = { path = "crates/pf-service", version = "1.0.0" }
 
 [profile.release]
 lto = "thin"
