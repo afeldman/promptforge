@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.png" alt="PromptForge" width="200">
+</p>
+
 # PromptForge
 
 **Local-first Prompt Compiler.** Aus einer kurzen natürlichen Beschreibung
