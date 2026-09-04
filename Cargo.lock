@@ -1459,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "pf-bridge"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "pf-core",
  "pyo3",
@@ -1469,7 +1469,7 @@ dependencies = [
 
 [[package]]
 name = "pf-cli"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "clap",
  "pf-bridge",
@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "pf-core"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "arboard",
  "chrono",
@@ -1503,7 +1503,7 @@ dependencies = [
 
 [[package]]
 name = "pf-engine"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "pf-core",
  "serde",
@@ -1513,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "pf-service"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "axum",
  "pf-core",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "pf-tui"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "crossterm",
  "pf-core",
