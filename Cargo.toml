@@ -14,7 +14,7 @@ version = "0.1.6"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-authors = ["Paper Guard Contributors"]
+authors = ["PromptForge Contributors"]
 repository = "https://github.com/afeldman/promptforge.git"
 description = "PromptForge: A framework for building and managing prompt-based applications."
 
