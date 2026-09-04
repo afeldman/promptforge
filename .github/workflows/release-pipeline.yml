@@ -65,7 +65,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.checkout_ref }}
 
@@ -75,7 +75,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -120,7 +120,7 @@ jobs:
     needs: guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.checkout_ref }}
       - uses: dtolnay/rust-toolchain@stable
@@ -145,7 +145,7 @@ jobs:
       RELEASE_TAG: ${{ inputs.release_tag }}
       TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.checkout_ref }}
 
@@ -157,7 +157,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -184,7 +184,7 @@ jobs:
               && shasum -a 256 -c "${NAME}.tar.gz.sha256" )
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.name }}
           path: dist/*
@@ -202,11 +202,11 @@ jobs:
       REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.checkout_ref }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

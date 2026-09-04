@@ -38,7 +38,7 @@ jobs:
     
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@master
@@ -50,7 +50,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install uv (Python Package Manager)
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -129,7 +129,7 @@ jobs:
       # Hinweis: Keine Secrets oder LLM-Prompts in Artefakten
       
       - name: Upload Rust Build Artifacts (Release Binary)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: prompt-forge-release-binary
@@ -138,7 +138,7 @@ jobs:
           retention-days: 7
 
       - name: Upload Rust Test Logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: rust-test-logs
@@ -149,7 +149,7 @@ jobs:
           retention-days: 3
 
       - name: Upload Python Test Logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: python-test-logs
@@ -165,7 +165,7 @@ jobs:
     
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@master
@@ -178,7 +178,7 @@ jobs:
           key: apfel
 
       - name: Install uv (Python Package Manager)
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -241,7 +241,7 @@ jobs:
       # --- Artefakte bei Apfel-Test-Fehlern (optional) ---
       - name: Upload Apfel Test Logs (macOS only, auf Fehler)
         if: runner.os == 'macOS' && failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: apfel-test-logs
           path: |
