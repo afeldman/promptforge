@@ -178,8 +178,10 @@ jobs:
           NAME="prompt-forge-${RELEASE_TAG}-${TARGET}"
           mkdir -p dist
           tar -czf "dist/${NAME}.tar.gz" -C "target/${TARGET}/release" prompt-forge
-          ( cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
-          shasum -a 256 -c "dist/${NAME}.tar.gz.sha256"
+          # checksum file lists the bare archive name -> generate and verify from inside dist/
+          ( cd dist \
+              && shasum -a 256 "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256" \
+              && shasum -a 256 -c "${NAME}.tar.gz.sha256" )
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
