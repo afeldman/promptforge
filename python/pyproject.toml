@@ -4,8 +4,8 @@ version = "1.0.0"
 description = "PromptForge Python AI layer: LLM-Provider-Abstraktion und LLM-gestützte Architect/Optimize/Verify-Passes"
 requires-python = ">=3.11"
 dependencies = [
-    "any-llm-sdk>=1.26.0",
-    "loguru>=0.7.3",
+    "any-llm-sdk>=1.52.0",
+    "loguru>=0.8.0",
 ]
 
 [build-system]
@@ -26,7 +26,7 @@ target-version = "py311"
 
 [dependency-groups]
 dev = [
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.5.0",
     "pytest-cov>=7.1.0",
 ]
